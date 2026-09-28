@@ -17,6 +17,22 @@ const toPort = (value, fallback) => {
   return Number.isNaN(parsed) ? fallback : parsed;
 };
 
+/**
+ * Fails fast at startup rather than at the first login attempt.
+ * JWT signing is impossible without it, so the API must not start.
+ */
+const requireSecret = (name) => {
+  const value = process.env[name];
+
+  if (!value || value.trim() === '') {
+    throw new Error(
+      `${name} is not set. Copy .env.example to .env and provide a strong random value.`,
+    );
+  }
+
+  return value;
+};
+
 /** Single source of truth for every environment-dependent setting. */
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? 'development',
@@ -27,7 +43,7 @@ export const env = {
     .map((origin) => origin.trim())
     .filter(Boolean),
   databaseUrl: process.env.DATABASE_URL,
-  jwtSecret: process.env.JWT_SECRET,
+  jwtSecret: requireSecret('JWT_SECRET'),
 };
 
 export const isProduction = env.nodeEnv === 'production';
