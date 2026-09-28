@@ -1,0 +1,14 @@
+// Prisma schema for RoBen RidePool.
+//
+// Only the PostgreSQL connection is configured for now. Domain models
+// (User, Driver, Vehicle, Ride, RideRequest, Rating...) are added as
+// features are implemented and migrated with `npx prisma migrate dev`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
