@@ -1,8 +1,7 @@
 // Prisma schema for RoBen RidePool.
 //
-// Only the PostgreSQL connection is configured for now. Domain models
-// (User, Driver, Vehicle, Ride, RideRequest, Rating...) are added as
-// features are implemented and migrated with `npx prisma migrate dev`.
+// PostgreSQL connection + the authentication domain. Ride, driver and vehicle
+// models are added as those features are implemented.
 
 generator client {
   provider = "prisma-client-js"
@@ -11,4 +10,25 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+}
+
+/// Platform role. Chosen at registration and enforced by `requireRole`.
+enum Role {
+  PASSENGER
+  DRIVER
+}
+
+model User {
+  id String @id @default(uuid())
+
+  name         String
+  email        String @unique
+  /// bcrypt hash. The plaintext password never leaves the request handler.
+  passwordHash String
+  role         Role
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
 }

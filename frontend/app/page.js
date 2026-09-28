@@ -1,4 +1,5 @@
 import { ApiStatusCard } from "../components/api-status-card";
+import { SessionCard } from "../components/session-card";
 
 const STACK = [
   { name: "Next.js 16 (App Router)", role: "Frontend" },
@@ -10,10 +11,10 @@ const STACK = [
 ];
 
 const PLANNED = [
-  "JWT authentication for passengers and drivers",
   "Ride request, matching and tracking endpoints",
   "Role-aware passenger and driver dashboards",
-  "End-to-end and unit test coverage",
+  "Password reset and email verification",
+  "Broader test coverage and CI pipeline",
 ];
 
 export default function Home() {
@@ -35,6 +36,8 @@ export default function Home() {
 
       <div className="grid gap-6 md:grid-cols-2">
         <ApiStatusCard />
+
+        <SessionCard />
 
         <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
           <h2 className="text-sm font-semibold tracking-wide text-slate-500 uppercase">
