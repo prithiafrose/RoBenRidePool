@@ -251,3 +251,153 @@ describe('POST /api/ride-requests', () => {
     expect(response.status).toBe(201);
   });
 });
+
+/** Creates requests for one passenger, waiting so `createdAt` cannot tie. */
+const createSeveral = async (token, count) => {
+  const created = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const { body } = await createRide(token, {
+      ...rideRequest,
+      pickupArea: `Area ${index + 1}`,
+    });
+
+    created.push(body.data.rideRequest);
+    // `createdAt` has millisecond precision, so back-to-back inserts can share a
+    // timestamp. Spacing them keeps the newest-first assertion deterministic.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  return created;
+};
+
+const listRides = (token) => request(app).get('/api/ride-requests').set('Authorization', `Bearer ${token}`);
+
+describe('GET /api/ride-requests', () => {
+  let token;
+  let userId;
+
+  beforeEach(async () => {
+    ({ token, userId } = await authenticate());
+  });
+
+  it('returns an empty list for a passenger with no requests', async () => {
+    const response = await listRides(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      success: true,
+      message: 'Ride requests retrieved successfully',
+    });
+    expect(response.body.data.rideRequests).toEqual([]);
+  });
+
+  it("returns the passenger's own requests", async () => {
+    const [created] = await createSeveral(token, 1);
+
+    const response = await listRides(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.rideRequests).toHaveLength(1);
+    expect(response.body.data.rideRequests[0]).toMatchObject({
+      id: created.id,
+      passengerId: userId,
+      pickupArea: 'Area 1',
+      destinationArea: 'Gulshan',
+      seatsRequested: 2,
+      status: 'WAITING',
+      finalFarePaisa: null,
+    });
+  });
+
+  it("never returns another passenger's requests", async () => {
+    const other = await authenticate({ email: 'tariq@example.com', name: 'Tariq Rahman' });
+    await createSeveral(token, 2);
+    const [{ id: otherId }] = await createSeveral(other.token, 1);
+
+    const response = await listRides(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.rideRequests).toHaveLength(2);
+
+    for (const item of response.body.data.rideRequests) {
+      expect(item.passengerId).toBe(userId);
+    }
+
+    expect(response.body.data.rideRequests.map((item) => item.id)).not.toContain(otherId);
+
+    // The other passenger really does have a request, so the assertion above
+    // is not passing just because the list happens to be empty.
+    const otherList = await listRides(other.token);
+    expect(otherList.body.data.rideRequests.map((item) => item.id)).toContain(otherId);
+  });
+
+  it('returns the newest request first', async () => {
+    const created = await createSeveral(token, 3);
+
+    const response = await listRides(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.rideRequests).toHaveLength(3);
+
+    const timestamps = response.body.data.rideRequests.map((item) => new Date(item.createdAt).getTime());
+
+    for (let index = 1; index < timestamps.length; index += 1) {
+      expect(timestamps[index]).toBeLessThanOrEqual(timestamps[index - 1]);
+    }
+
+    // The last request created is the newest, so it must come first.
+    expect(response.body.data.rideRequests[0].id).toBe(created.at(-1).id);
+  });
+
+  it('never exposes the passenger record or a password hash', async () => {
+    await createSeveral(token, 2);
+
+    const response = await listRides(token);
+
+    for (const item of response.body.data.rideRequests) {
+      expect(item).not.toHaveProperty('passenger');
+    }
+
+    expect(JSON.stringify(response.body)).not.toContain('passwordHash');
+    expect(JSON.stringify(response.body)).not.toContain(passenger.password);
+  });
+
+  it('returns DTO fields that match the persisted row', async () => {
+    const [created] = await createSeveral(token, 1);
+
+    const response = await listRides(token);
+    const stored = await prisma.rideRequest.findUnique({ where: { id: created.id } });
+
+    expect(response.body.data.rideRequests[0]).toMatchObject({
+      id: stored.id,
+      passengerId: stored.passengerId,
+      pickupArea: stored.pickupArea,
+      destinationArea: stored.destinationArea,
+      seatsRequested: stored.seatsRequested,
+      estimatedFarePaisa: stored.estimatedFarePaisa,
+      finalFarePaisa: stored.finalFarePaisa,
+      status: stored.status,
+    });
+  });
+
+  it('rejects an unauthenticated request with 401', async () => {
+    const response = await request(app).get('/api/ride-requests');
+
+    expect(response.status).toBe(401);
+    expect(response.body.success).toBe(false);
+  });
+
+  it('rejects a driver with 403', async () => {
+    const driver = await authenticate({
+      email: 'rafiq@example.com',
+      name: 'Rafiq Islam',
+      role: 'DRIVER',
+    });
+
+    const response = await listRides(driver.token);
+
+    expect(response.status).toBe(403);
+    expect(response.body.message).toBe('You do not have permission to perform this action');
+  });
+});

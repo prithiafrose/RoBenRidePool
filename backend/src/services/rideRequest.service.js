@@ -74,3 +74,20 @@ export const createRideRequest = async (passengerId, request) => {
 
   return toRideRequest(rideRequest);
 };
+
+/**
+ * Lists one passenger's ride requests, newest first.
+ *
+ * Scoped to the authenticated passenger only: `passengerId` comes from the
+ * access token, so a caller can never list somebody else's requests. The
+ * `passengerId, createdAt` index on the table serves this filter and ordering.
+ * An empty history is a normal outcome and returns an empty array.
+ */
+export const listRideRequests = async (passengerId) => {
+  const rideRequests = await prisma.rideRequest.findMany({
+    where: { passengerId },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  return rideRequests.map(toRideRequest);
+};
