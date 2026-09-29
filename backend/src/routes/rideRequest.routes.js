@@ -1,6 +1,6 @@
 import { Router } from 'express';
 
-import { create, getById, list } from '../controllers/rideRequest.controller.js';
+import { cancel, create, getById, list } from '../controllers/rideRequest.controller.js';
 import { authenticate } from '../middleware/auth.middleware.js';
 import { requireRole } from '../middleware/role.middleware.js';
 import { validateBody, validateParams } from '../middleware/validate.middleware.js';
@@ -20,6 +20,15 @@ router.get(
   requireRole('PASSENGER'),
   validateParams(rideRequestIdParamSchema),
   getById,
+);
+// A PATCH cannot match the GET/POST collection routes above, since Express
+// matches the method first, so ordering is for readability only.
+router.patch(
+  '/:id/cancel',
+  authenticate,
+  requireRole('PASSENGER'),
+  validateParams(rideRequestIdParamSchema),
+  cancel,
 );
 
 export default router;

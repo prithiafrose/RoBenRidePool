@@ -118,3 +118,52 @@ export const getRideRequestById = async (passengerId, id) => {
 
   return toRideRequest(rideRequest);
 };
+
+/**
+ * Cancels one of a passenger's own requests.
+ *
+ * The state guard lives in the query predicate rather than in a check made
+ * after reading the row. `updateMany` compiles to a single
+ * `UPDATE ... WHERE id = ? AND passengerId = ? AND status = 'WAITING'`, so
+ * PostgreSQL decides the winner: a cancel racing a pool-match cannot overwrite
+ * `MATCHED`, and two concurrent cancels cannot both report success. Reading
+ * first and then writing would leave that window open.
+ *
+ * `count === 0` means the guard did not match, which has two causes that the
+ * caller must not be able to tell apart without owning the row. The follow-up
+ * lookup is ownership-scoped, so it returns `null` for both "does not exist"
+ * and "belongs to somebody else", and both produce the identical 404 used by
+ * `getRideRequestById`. Only a row this passenger owns can reach the 409.
+ *
+ * `passengerId` always comes from the verified access token. The `passenger`
+ * relation is never selected, so `passwordHash` cannot reach the response.
+ */
+export const cancelRideRequest = async (passengerId, id) => {
+  const { count } = await prisma.rideRequest.updateMany({
+    where: {
+      id,
+      passengerId,
+      status: 'WAITING',
+    },
+    data: {
+      status: 'CANCELLED',
+    },
+  });
+
+  if (count === 1) {
+    return getRideRequestById(passengerId, id);
+  }
+
+  const ownRequest = await prisma.rideRequest.findFirst({
+    where: {
+      id,
+      passengerId,
+    },
+  });
+
+  if (!ownRequest) {
+    throw AppError.notFound('Ride request not found');
+  }
+
+  throw AppError.conflict('Ride request cannot be cancelled in its current status');
+};

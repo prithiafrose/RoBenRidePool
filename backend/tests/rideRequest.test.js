@@ -602,3 +602,270 @@ describe('GET /api/ride-requests/:id', () => {
     });
   });
 });
+
+const cancelRide = (token, id) =>
+  request(app)
+    .patch(`/api/ride-requests/${id}/cancel`)
+    .set('Authorization', `Bearer ${token}`);
+
+/**
+ * Test-only helper: forces a status that no endpoint can produce yet, so the
+ * non-cancellable transitions can be exercised. Production code never sets a
+ * status other than the Prisma default and the cancel transition itself.
+ */
+const forceStatus = async (id, status) => {
+  const updated = await prisma.rideRequest.update({ where: { id }, data: { status } });
+
+  return updated;
+};
+
+describe('PATCH /api/ride-requests/:id/cancel', () => {
+  let token;
+  let userId;
+
+  beforeEach(async () => {
+    ({ token, userId } = await authenticate());
+  });
+
+  it("cancels the passenger's own WAITING request", async () => {
+    const created = await createOne(token);
+
+    const response = await cancelRide(token, created.id);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      success: true,
+      message: 'Ride request cancelled successfully',
+    });
+    expect(response.body.data.rideRequest).toMatchObject({
+      id: created.id,
+      passengerId: userId,
+      status: 'CANCELLED',
+    });
+  });
+
+  it('actually persists the cancellation', async () => {
+    const created = await createOne(token);
+
+    await cancelRide(token, created.id);
+
+    const stored = await prisma.rideRequest.findUnique({ where: { id: created.id } });
+    expect(stored.status).toBe('CANCELLED');
+  });
+
+  it('returns DTO fields that match the persisted row', async () => {
+    const created = await createOne(token);
+
+    const response = await cancelRide(token, created.id);
+    const stored = await prisma.rideRequest.findUnique({ where: { id: created.id } });
+
+    expect(response.body.data.rideRequest).toMatchObject({
+      id: stored.id,
+      passengerId: stored.passengerId,
+      pickupArea: stored.pickupArea,
+      destinationArea: stored.destinationArea,
+      seatsRequested: stored.seatsRequested,
+      estimatedFarePaisa: stored.estimatedFarePaisa,
+      finalFarePaisa: stored.finalFarePaisa,
+      status: stored.status,
+    });
+  });
+
+  it('returns exactly the documented DTO fields', async () => {
+    const created = await createOne(token);
+
+    const response = await cancelRide(token, created.id);
+
+    expect(Object.keys(response.body.data.rideRequest).sort()).toEqual(
+      [
+        'id',
+        'passengerId',
+        'pickupArea',
+        'pickupLat',
+        'pickupLng',
+        'destinationArea',
+        'destinationLat',
+        'destinationLng',
+        'seatsRequested',
+        'estimatedFarePaisa',
+        'finalFarePaisa',
+        'status',
+        'createdAt',
+      ].sort(),
+    );
+  });
+
+  it('does not expose the passenger record or a password hash', async () => {
+    const created = await createOne(token);
+
+    const response = await cancelRide(token, created.id);
+
+    expect(response.body.data.rideRequest).not.toHaveProperty('passenger');
+    expect(JSON.stringify(response.body)).not.toContain('passwordHash');
+    expect(JSON.stringify(response.body)).not.toContain(passenger.password);
+  });
+
+  it("refuses another passenger's request and leaves it untouched", async () => {
+    const other = await authenticate({ email: 'tariq@example.com', name: 'Tariq Rahman' });
+    const foreign = await createOne(other.token);
+
+    const stored = await prisma.rideRequest.findUnique({ where: { id: foreign.id } });
+    expect(stored).not.toBeNull();
+    expect(stored.passengerId).toBe(other.userId);
+
+    const response = await cancelRide(token, foreign.id);
+
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({
+      success: false,
+      message: 'Ride request not found',
+    });
+
+    // The refusal must not have cancelled the other passenger's request.
+    const unchanged = await prisma.rideRequest.findUnique({ where: { id: foreign.id } });
+    expect(unchanged.status).toBe('WAITING');
+  });
+
+  it('answers a foreign request exactly like a nonexistent one', async () => {
+    const other = await authenticate({ email: 'sabina@example.com', name: 'Sabina Akter' });
+    const foreign = await createOne(other.token);
+
+    const foreignResponse = await cancelRide(token, foreign.id);
+    const missingResponse = await cancelRide(token, randomUUID());
+
+    expect(foreignResponse.status).toBe(missingResponse.status);
+    expect(foreignResponse.body).toEqual(missingResponse.body);
+    expect(Object.keys(foreignResponse.body).sort()).toEqual(
+      Object.keys(missingResponse.body).sort(),
+    );
+  });
+
+  it('returns 404 for a valid UUID that does not exist', async () => {
+    const response = await cancelRide(token, randomUUID());
+
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({
+      success: false,
+      message: 'Ride request not found',
+    });
+  });
+
+  it.each(['not-a-uuid', '123', 'abc-def'])(
+    'rejects the malformed id %j with 400 and a field error',
+    async (id) => {
+      const response = await cancelRide(token, id);
+
+      expect(response.status).toBe(400);
+      expect(response.body.message).toBe('Validation failed');
+      expect(response.body.details.map((detail) => detail.field)).toContain('id');
+    },
+  );
+
+  it('rejects a driver with 403', async () => {
+    const driver = await authenticate({
+      email: 'rafiq@example.com',
+      name: 'Rafiq Islam',
+      role: 'DRIVER',
+    });
+    const created = await createOne(token);
+
+    const response = await cancelRide(driver.token, created.id);
+
+    expect(response.status).toBe(403);
+    expect(response.body.message).toBe('You do not have permission to perform this action');
+  });
+
+  it('rejects an unauthenticated request with 401', async () => {
+    const created = await createOne(token);
+
+    const response = await request(app).patch(`/api/ride-requests/${created.id}/cancel`);
+
+    expect(response.status).toBe(401);
+    expect(response.body.success).toBe(false);
+  });
+
+  it('rejects a garbage token with 401', async () => {
+    const created = await createOne(token);
+
+    const response = await request(app)
+      .patch(`/api/ride-requests/${created.id}/cancel`)
+      .set('Authorization', 'Bearer not.a.jwt');
+
+    expect(response.status).toBe(401);
+    expect(response.body.success).toBe(false);
+  });
+
+  it.each(['MATCHED', 'IN_PROGRESS', 'COMPLETED'])(
+    'rejects a %s request with 409 and leaves the status unchanged',
+    async (status) => {
+      const created = await createOne(token);
+      await forceStatus(created.id, status);
+
+      const response = await cancelRide(token, created.id);
+
+      expect(response.status).toBe(409);
+      expect(response.body).toMatchObject({
+        success: false,
+        message: 'Ride request cannot be cancelled in its current status',
+      });
+
+      const stored = await prisma.rideRequest.findUnique({ where: { id: created.id } });
+      expect(stored.status).toBe(status);
+    },
+  );
+
+  it('rejects a second cancellation of an already CANCELLED request', async () => {
+    const created = await createOne(token);
+    await cancelRide(token, created.id);
+
+    const response = await cancelRide(token, created.id);
+
+    expect(response.status).toBe(409);
+    expect(response.body.message).toBe('Ride request cannot be cancelled in its current status');
+
+    const stored = await prisma.rideRequest.findUnique({ where: { id: created.id } });
+    expect(stored.status).toBe('CANCELLED');
+  });
+
+  it('rejects a concurrent double cancellation with exactly one 200', async () => {
+    const created = await createOne(token);
+
+    // The service guards the transition in the UPDATE predicate, so exactly one
+    // of these can match the row and the other must fall through to the 409.
+    const responses = await Promise.all([
+      cancelRide(token, created.id),
+      cancelRide(token, created.id),
+    ]);
+
+    const statuses = responses.map((response) => response.status).sort();
+    expect(statuses).toEqual([200, 409]);
+
+    const failed = responses.find((response) => response.status === 409);
+    expect(failed.body.message).toBe('Ride request cannot be cancelled in its current status');
+
+    const stored = await prisma.rideRequest.findUnique({ where: { id: created.id } });
+    expect(stored.status).toBe('CANCELLED');
+  });
+
+  it('does not touch a second WAITING request of the same passenger', async () => {
+    const target = await createOne(token, { pickupArea: 'Dhanmondi' });
+    const other = await createOne(token, { pickupArea: 'Gulshan' });
+
+    const response = await cancelRide(token, target.id);
+    expect(response.status).toBe(200);
+
+    const stored = await prisma.rideRequest.findUnique({ where: { id: other.id } });
+    expect(stored.status).toBe('WAITING');
+  });
+
+  it('shows the cancelled status in the collection listing', async () => {
+    const created = await createOne(token);
+    await cancelRide(token, created.id);
+
+    const response = await listRides(token);
+
+    expect(response.status).toBe(200);
+    const listed = response.body.data.rideRequests.find((item) => item.id === created.id);
+    expect(listed.status).toBe('CANCELLED');
+  });
+});

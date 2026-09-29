@@ -1,4 +1,5 @@
 import {
+  cancelRideRequest,
   createRideRequest,
   getRideRequestById,
   listRideRequests,
@@ -24,4 +25,11 @@ export const getById = async (req, res) => {
   const rideRequest = await getRideRequestById(req.user.id, req.params.id);
 
   return sendSuccess(res, { rideRequest }, 200, 'Ride request retrieved successfully');
+};
+
+/** PATCH /api/ride-requests/:id/cancel (protected by `authenticate` and `requireRole`) */
+export const cancel = async (req, res) => {
+  const rideRequest = await cancelRideRequest(req.user.id, req.params.id);
+
+  return sendSuccess(res, { rideRequest }, 200, 'Ride request cancelled successfully');
 };
