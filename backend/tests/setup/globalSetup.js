@@ -2,8 +2,17 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import dotenv from 'dotenv';
+
 // This file lives in `tests/setup/`, so the backend root is two levels up.
 const backendDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const rootDir = path.resolve(backendDir, '..');
+
+// Vitest loads this file before any application module, so `src/config/env.js`
+// has not run yet. Load the same files, with the same precedence, or the
+// database settings below would be read before .env had been applied.
+dotenv.config({ path: path.join(backendDir, '.env'), quiet: true });
+dotenv.config({ path: path.join(rootDir, '.env'), quiet: true });
 
 /**
  * Integration tests run against a real PostgreSQL database, but never the
