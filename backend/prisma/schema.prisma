@@ -1,7 +1,8 @@
 // Prisma schema for RoBen RidePool.
 //
-// PostgreSQL connection + the authentication domain. Ride, driver and vehicle
-// models are added as those features are implemented.
+// PostgreSQL connection, the authentication domain and the core ride-pool
+// domain. Money is always stored as an integer number of paisa (1 BDT = 100
+// paisa; formally "poisha"). No floating point is used for money anywhere.
 
 generator client {
   provider = "prisma-client-js"
@@ -12,11 +13,51 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
 /// Platform role. Chosen at registration and enforced by `requireRole`.
 enum Role {
   PASSENGER
   DRIVER
 }
+
+/// Availability of a driver. Set by the driver, read by the matching step.
+enum DriverStatus {
+  ONLINE
+  OFFLINE
+}
+
+/// Lifecycle of a passenger's ride request.
+enum RideRequestStatus {
+  /// Created, not yet matched to any pool.
+  WAITING
+  /// Accepted into a pool (see PoolMember).
+  MATCHED
+  /// The pool carrying this request is on the road.
+  IN_PROGRESS
+  /// Ride finished.
+  COMPLETED
+  /// Withdrawn by the passenger, or rejected.
+  CANCELLED
+}
+
+/// Lifecycle of a shared ride.
+enum PoolStatus {
+  /// Accepting ride requests.
+  OPEN
+  /// Under way, no new members.
+  IN_PROGRESS
+  /// Finished.
+  COMPLETED
+  /// Abandoned before departure.
+  CANCELLED
+}
+
+// ---------------------------------------------------------------------------
+// Accounts
+// ---------------------------------------------------------------------------
 
 model User {
   id String @id @default(uuid())
@@ -30,5 +71,172 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  // A user becomes a driver by creating a DriverProfile. One-to-one, optional.
+  driverProfile DriverProfile?
+  /// Ride requests this user made as a passenger.
+  rideRequests  RideRequest[]
+
   @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Driver and vehicle
+// ---------------------------------------------------------------------------
+
+/// Driving profile of a user whose role is DRIVER. Kept separate from User so
+/// passengers never carry driver-only columns.
+model DriverProfile {
+  id String @id @default(uuid())
+
+  /// One driving profile per user.
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status DriverStatus @default(OFFLINE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// For the MVP a driver owns exactly one Tesla, so this is 1-to-1.
+  tesla Tesla?
+  /// Pools this driver is offering.
+  pools Pool[]
+
+  @@index([status])
+  @@map("driver_profiles")
+}
+
+/// The vehicle a driver offers for pooling.
+model Tesla {
+  id String @id @default(uuid())
+
+  /// MVP constraint: one Tesla per driver, enforced by the unique index.
+  driverId String        @unique
+  driver   DriverProfile @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  /// Registration plate, unique across the fleet.
+  plateNumber  String @unique
+  model        String
+  /// Passenger seats offered for pooling, including the driver's own seat.
+  /// The pool capacity check in the service layer is measured against this.
+  seatCapacity Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Pools driven with this Tesla.
+  pools Pool[]
+
+  @@map("teslas")
+}
+
+// ---------------------------------------------------------------------------
+// Ride requests
+// ---------------------------------------------------------------------------
+
+/// A passenger's intent to travel: where from, where to, how many seats.
+model RideRequest {
+  id String @id @default(uuid())
+
+  /// Exactly one passenger owns a request.
+  passengerId String
+  passenger   User   @relation(fields: [passengerId], references: [id], onDelete: Cascade)
+
+  // Geography is modelled with predefined Dhaka areas (for example
+  // "Dhanmondi", "Gulshan", "Banani"). Real routing is out of scope; the
+  // coordinates are optional and used only to draw or estimate distance.
+  pickupArea      String
+  pickupLat       Float?
+  pickupLng       Float?
+  destinationArea String
+  destinationLat  Float?
+  destinationLng  Float?
+
+  /// Seats the passenger wants. 1..capacity of the eventual Tesla.
+  seatsRequested     Int
+  /// Estimate at request time, in paisa. 32-bit Int allows ~21.4M BDT, which
+  /// is far above any single fare.
+  estimatedFarePaisa Int
+  /// Settled amount, written when the ride completes. Null while pending.
+  finalFarePaisa     Int?
+
+  status RideRequestStatus @default(WAITING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The membership rows this request takes part in. A request is expected to
+  /// be in at most one active pool; see PoolMember for the enforced part.
+  poolMemberships PoolMember[]
+
+  // Matching queue: oldest WAITING requests first, per passenger history.
+  @@index([status, createdAt])
+  @@index([passengerId, createdAt])
+  // Area pair lookups for the future matching step.
+  @@index([pickupArea, destinationArea])
+  @@map("ride_requests")
+}
+
+// ---------------------------------------------------------------------------
+// Pools
+// ---------------------------------------------------------------------------
+
+/// A shared ride: one driver, one Tesla, many ride requests.
+model Pool {
+  id String @id @default(uuid())
+
+  /// The driver offering the ride.
+  driverId String
+  driver   DriverProfile @relation(fields: [driverId], references: [id], onDelete: Restrict)
+
+  /// The Tesla actually used. Must be the driver's own Tesla; PostgreSQL
+  /// cannot express that cross-table rule, so the service layer verifies it.
+  vehicleId String
+  vehicle   Tesla  @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+
+  status PoolStatus @default(OPEN)
+
+  /// When the pool left the origin, and when it finished.
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The ride requests sharing this Tesla, with their allocated seats and
+  /// their individual fare.
+  members PoolMember[]
+
+  // "Which open pools does this driver have?" and lifecycle listings.
+  @@index([driverId, status])
+  @@index([status, createdAt])
+  @@map("pools")
+}
+
+/// Join row between a Pool and a RideRequest, carrying the per-passenger
+/// allocation. Nusrat and Rafiq can share one Tesla while paying different
+/// fares, so seats and fare live here rather than on Pool or RideRequest.
+model PoolMember {
+  id String @id @default(uuid())
+
+  poolId        String
+  pool          Pool        @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  /// MVP rule: a ride request may belong to at most one pool.
+  rideRequestId String      @unique
+  rideRequest   RideRequest @relation(fields: [rideRequestId], references: [id], onDelete: Cascade)
+
+  /// Seats allocated to this request within the pool. The sum over a pool must
+  /// never exceed the Tesla's seatCapacity.
+  seats     Int
+  /// Individual fare for this passenger, in paisa.
+  farePaisa Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// A request cannot be added to the same pool twice.
+  @@unique([poolId, rideRequestId])
+  /// Reverse lookup: "which pool is this request in?" is served by the unique
+  /// index on rideRequestId, so no separate @@index is declared here.
+  @@map("pool_members")
 }
