@@ -91,3 +91,30 @@ export const listRideRequests = async (passengerId) => {
 
   return rideRequests.map(toRideRequest);
 };
+
+/**
+ * One passenger's request by id.
+ *
+ * The ownership check is part of the query predicate, not a comparison made
+ * after the row is fetched: `findFirst` returns `null` both when the id does
+ * not exist and when it belongs to somebody else, so a foreign id produces the
+ * exact same `Ride request not found` 404 as a missing one. Returning 403
+ * instead would confirm that the id exists and leak other passengers' ids.
+ *
+ * `passengerId` always comes from the verified access token. The `passenger`
+ * relation is not selected, so `passwordHash` cannot reach the response.
+ */
+export const getRideRequestById = async (passengerId, id) => {
+  const rideRequest = await prisma.rideRequest.findFirst({
+    where: {
+      id,
+      passengerId,
+    },
+  });
+
+  if (!rideRequest) {
+    throw AppError.notFound('Ride request not found');
+  }
+
+  return toRideRequest(rideRequest);
+};

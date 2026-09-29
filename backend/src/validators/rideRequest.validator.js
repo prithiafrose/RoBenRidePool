@@ -75,3 +75,15 @@ export const createRideRequestSchema = z
     destinationLng: longitude('Destination longitude').optional(),
   })
   .superRefine(latLngPair);
+
+/**
+ * Path parameter of `GET /api/ride-requests/:id`.
+ *
+ * `id` is a Prisma `@default(uuid())` primary key, so a value that is not a
+ * UUID can never match a row. Rejecting it here turns a client typo into a 400
+ * with a field-level message, instead of a 404 that is indistinguishable from a
+ * legitimately deleted request.
+ */
+export const rideRequestIdParamSchema = z.object({
+  id: z.uuid('Ride request id must be a valid UUID'),
+});

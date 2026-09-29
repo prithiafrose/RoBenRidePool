@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import request from 'supertest';
 import { beforeEach, describe, expect, it } from 'vitest';
 
@@ -399,5 +401,204 @@ describe('GET /api/ride-requests', () => {
 
     expect(response.status).toBe(403);
     expect(response.body.message).toBe('You do not have permission to perform this action');
+  });
+});
+
+const getRide = (token, id) =>
+  request(app)
+    .get(`/api/ride-requests/${id}`)
+    .set('Authorization', `Bearer ${token}`);
+
+/** Creates one request and returns it, so the id under test comes from a real row. */
+const createOne = async (token, overrides = {}) => {
+  const { body } = await createRide(token, { ...rideRequest, ...overrides });
+
+  return body.data.rideRequest;
+};
+
+describe('GET /api/ride-requests/:id', () => {
+  let token;
+  let userId;
+
+  beforeEach(async () => {
+    ({ token, userId } = await authenticate());
+  });
+
+  it("returns the passenger's own request", async () => {
+    const created = await createOne(token);
+
+    const response = await getRide(token, created.id);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      success: true,
+      message: 'Ride request retrieved successfully',
+    });
+    expect(response.body.data.rideRequest).toMatchObject({
+      id: created.id,
+      passengerId: userId,
+      status: 'WAITING',
+      finalFarePaisa: null,
+    });
+  });
+
+  it("returns another passenger's request as 404, even though the row exists", async () => {
+    const other = await authenticate({ email: 'tariq@example.com', name: 'Tariq Rahman' });
+    const foreign = await createOne(other.token);
+
+    // The row really is there, so the 404 below cannot pass vacuously.
+    const stored = await prisma.rideRequest.findUnique({ where: { id: foreign.id } });
+    expect(stored).not.toBeNull();
+    expect(stored.passengerId).toBe(other.userId);
+    expect(stored.passengerId).not.toBe(userId);
+
+    const response = await getRide(token, foreign.id);
+
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({
+      success: false,
+      message: 'Ride request not found',
+    });
+    expect(response.body.data).toBeUndefined();
+  });
+
+  it('answers a foreign request exactly like a nonexistent one', async () => {
+    const other = await authenticate({ email: 'sabina@example.com', name: 'Sabina Akter' });
+    const foreign = await createOne(other.token);
+
+    const foreignResponse = await getRide(token, foreign.id);
+    const missingResponse = await getRide(token, randomUUID());
+
+    // Same status, same message, same envelope keys: the response cannot be
+    // used to learn that somebody else's id exists.
+    expect(foreignResponse.status).toBe(missingResponse.status);
+    expect(foreignResponse.body).toEqual(missingResponse.body);
+    expect(Object.keys(foreignResponse.body).sort()).toEqual(
+      Object.keys(missingResponse.body).sort(),
+    );
+  });
+
+  it('returns 404 for a valid UUID that does not exist', async () => {
+    const response = await getRide(token, randomUUID());
+
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({
+      success: false,
+      message: 'Ride request not found',
+    });
+  });
+
+  it.each(['not-a-uuid', '123', 'abc-def'])(
+    'rejects the malformed id %j with 400 and a field error',
+    async (id) => {
+      const response = await getRide(token, id);
+
+      expect(response.status).toBe(400);
+      expect(response.body.message).toBe('Validation failed');
+      expect(response.body.details.map((detail) => detail.field)).toContain('id');
+    },
+  );
+
+  it('serves an empty id as the collection route, not as a bad :id', async () => {
+    // `GET /api/ride-requests/` has no path segment after the router, so it
+    // matches `router.get('/')` and never reaches `/:id` or `validateParams`.
+    // An empty segment is indistinguishable from no segment, so this cannot be
+    // turned into a 400 without breaking the collection endpoint. Pinned here
+    // so the behaviour is deliberate rather than accidental.
+    await createOne(token);
+
+    const response = await getRide(token, '');
+
+    expect(response.status).toBe(200);
+    expect(response.body.message).toBe('Ride requests retrieved successfully');
+    expect(response.body.data.rideRequests).toHaveLength(1);
+  });
+
+  it('rejects a driver with 403', async () => {
+    const driver = await authenticate({
+      email: 'rafiq@example.com',
+      name: 'Rafiq Islam',
+      role: 'DRIVER',
+    });
+    const created = await createOne(token);
+
+    const response = await getRide(driver.token, created.id);
+
+    expect(response.status).toBe(403);
+    expect(response.body.message).toBe('You do not have permission to perform this action');
+  });
+
+  it('rejects an unauthenticated request with 401', async () => {
+    const created = await createOne(token);
+
+    const response = await request(app).get(`/api/ride-requests/${created.id}`);
+
+    expect(response.status).toBe(401);
+    expect(response.body.success).toBe(false);
+  });
+
+  it('rejects a garbage token with 401', async () => {
+    const created = await createOne(token);
+
+    const response = await request(app)
+      .get(`/api/ride-requests/${created.id}`)
+      .set('Authorization', 'Bearer not.a.jwt');
+
+    expect(response.status).toBe(401);
+    expect(response.body.success).toBe(false);
+  });
+
+  it('returns exactly the documented DTO fields', async () => {
+    const created = await createOne(token);
+
+    const response = await getRide(token, created.id);
+
+    // Asserting the full key set, so a field added to `toRideRequest` without
+    // review would fail here instead of leaking through unnoticed.
+    expect(Object.keys(response.body.data.rideRequest).sort()).toEqual(
+      [
+        'id',
+        'passengerId',
+        'pickupArea',
+        'pickupLat',
+        'pickupLng',
+        'destinationArea',
+        'destinationLat',
+        'destinationLng',
+        'seatsRequested',
+        'estimatedFarePaisa',
+        'finalFarePaisa',
+        'status',
+        'createdAt',
+      ].sort(),
+    );
+  });
+
+  it('does not expose the passenger record or a password hash', async () => {
+    const created = await createOne(token);
+
+    const response = await getRide(token, created.id);
+
+    expect(response.body.data.rideRequest).not.toHaveProperty('passenger');
+    expect(JSON.stringify(response.body)).not.toContain('passwordHash');
+    expect(JSON.stringify(response.body)).not.toContain(passenger.password);
+  });
+
+  it('returns DTO fields that match the persisted row', async () => {
+    const created = await createOne(token);
+
+    const response = await getRide(token, created.id);
+    const stored = await prisma.rideRequest.findUnique({ where: { id: created.id } });
+
+    expect(response.body.data.rideRequest).toMatchObject({
+      id: stored.id,
+      passengerId: stored.passengerId,
+      pickupArea: stored.pickupArea,
+      destinationArea: stored.destinationArea,
+      seatsRequested: stored.seatsRequested,
+      estimatedFarePaisa: stored.estimatedFarePaisa,
+      finalFarePaisa: stored.finalFarePaisa,
+      status: stored.status,
+    });
   });
 });
