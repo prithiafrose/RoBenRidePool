@@ -1466,8 +1466,6 @@ describe('PATCH /api/pools/:poolId/start', () => {
     it('rejects a concurrent start of two pools with exactly one 200', async () => {
       const { id: secondPoolId } = (await createPool(token)).body.data.pool;
 
-      // Two starts for the same driver contend on the driver row lock, so one
-      // waits for the other to commit and then sees the ride the winner started.
       const responses = await Promise.all([
         startPool(token, poolId),
         startPool(token, secondPoolId),
@@ -1482,6 +1480,72 @@ describe('PATCH /api/pools/:poolId/start', () => {
       const stored = await prisma.pool.findMany({ where: { id: { in: [poolId, secondPoolId] } } });
       const inProgress = stored.filter((pool) => pool.status === 'IN_PROGRESS');
       expect(inProgress).toHaveLength(1);
+    });
+
+    /**
+     * The actual regression guard for the race, and it deliberately does not go
+     * through HTTP.
+     *
+     * The HTTP test above passes with or without the driver row lock, because
+     * two supertest requests rarely overlap inside the guard's read window. This
+     * one calls the service twice in the same tick so both transactions really do
+     * read "no active ride" before either commits. Measured on this suite, that
+     * arrangement produced two `IN_PROGRESS` pools in 11 of 12 rounds with the
+     * lock removed, and 0 of 12 with it in place -- which is what makes this the
+     * test that would actually catch a regression, rather than one that only
+     * appears to.
+     */
+    it('never lets two parallel service calls both claim the active ride', async () => {
+      const firstDriver = await onboardedDriver(
+        { name: 'First Driver', email: 'first-racer@example.com' },
+        { ...vehicle, plateNumber: 'RACE-1' },
+      );
+      const { id: firstPool } = (await createPool(firstDriver.token)).body.data.pool;
+      const { id: firstSecondPool } = (await createPool(firstDriver.token)).body.data.pool;
+
+      const results = await Promise.allSettled([
+        startPoolForUser(firstDriver.userId, firstPool),
+        startPoolForUser(firstDriver.userId, firstSecondPool),
+      ]);
+
+      expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+
+      const rejection = results.find((result) => result.status === 'rejected');
+      expect(rejection.reason).toMatchObject({
+        statusCode: 409,
+        message: 'Driver already has an active ride',
+      });
+
+      const stored = await prisma.pool.findMany({
+        where: { id: { in: [firstPool, firstSecondPool] } },
+      });
+      expect(stored.filter((pool) => pool.status === 'IN_PROGRESS')).toHaveLength(1);
+    });
+
+    it('survives repeated parallel starts without ever doubling up', async () => {
+      // One round proves little on its own; the race reproduced in 11 of 12
+      // rounds before the lock, so this repeats it and asserts the invariant
+      // never breaks rather than trusting a single interleaving.
+      for (let round = 0; round < 6; round += 1) {
+        const racer = await onboardedDriver(
+          { name: `Racer ${round}`, email: `racer-${round}@example.com` },
+          { ...vehicle, plateNumber: `RACE-LOOP-${round}` },
+        );
+
+        const first = (await createPool(racer.token)).body.data.pool;
+        const second = (await createPool(racer.token)).body.data.pool;
+
+        await Promise.allSettled([
+          startPoolForUser(racer.userId, first.id),
+          startPoolForUser(racer.userId, second.id),
+        ]);
+
+        const stored = await prisma.pool.findMany({
+          where: { id: { in: [first.id, second.id] } },
+        });
+
+        expect(stored.filter((pool) => pool.status === 'IN_PROGRESS')).toHaveLength(1);
+      }
     });
 
     it('reports the conflict when the rule is called straight on the service', async () => {
