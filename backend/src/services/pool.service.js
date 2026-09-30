@@ -302,6 +302,70 @@ const findOwnPool = async (userId, poolId) => {
 };
 
 /**
+ * Takes a row lock on the driver's `driver_profiles` record for the rest of the
+ * current transaction, so concurrent lifecycle writes by *the same driver* run
+ * one after the other instead of interleaving.
+ *
+ * The one-active-ride rule below cannot be written as a conditional `UPDATE`
+ * the way the `OPEN -> IN_PROGRESS` transition is, because it spans a computed
+ * "does this driver have any other ride on the road" predicate rather than a
+ * value of the row being updated. Prisma cannot express that as a constraint
+ * either, which is why the specification puts it in the service layer.
+ *
+ * Without a lock, two `startPool` calls on two different pools of one driver
+ * would both read "no active ride" and both commit, leaving exactly the state
+ * this rule exists to prevent. Locking the one row that every such write must
+ * touch closes that window: the second transaction blocks on the lock and, under
+ * PostgreSQL's default READ COMMITTED isolation, then reads the first one's
+ * committed `IN_PROGRESS` row.
+ *
+ * The lock is on the driver and not on the pool, because the contended resource
+ * is the driver's single ride slot, not any individual pool row. It is also the
+ * narrower choice for concurrency: two different drivers never block each other,
+ * since each locks a row of their own.
+ */
+const lockDriverForActiveRide = async (tx, driverProfileId) => {
+  await tx.$queryRaw`SELECT id FROM driver_profiles WHERE id = ${driverProfileId} FOR UPDATE`;
+};
+
+/**
+ * Throws if `driverId` already has a ride on the road other than the pool being
+ * started: the "a driver has one active ride at a time" rule from
+ * `docs/architecture.md` (key relationships), which the document notes Prisma
+ * cannot express as a constraint.
+ *
+ * "Active" means `IN_PROGRESS` and nothing else:
+ *
+ *   - An `OPEN` pool is an offer, not a ride. Nobody has been picked up yet, and
+ *     nothing in the specification forbids a driver from staging several pools
+ *     and choosing between them, so this deliberately does not block opening or
+ *     starting a second pool while the first is still `OPEN`.
+ *   - A `COMPLETED` or `CANCELLED` pool is history and never blocks anything.
+ *
+ * The pool being started is excluded from the count. It is `OPEN` at this point,
+ * so it cannot match anyway, but excluding it states the rule as written -- a
+ * driver's ride in progress is the one being started *now* -- and keeps the
+ * check correct if it is ever reused from a different transition.
+ *
+ * Callers must already hold the driver lock from `lockDriverForActiveRide`, or
+ * this read can race a concurrent start and miss the row it is looking for.
+ */
+const assertNoOtherActiveRide = async (tx, driverId, startingPoolId) => {
+  const activeRide = await tx.pool.findFirst({
+    where: {
+      driverId,
+      status: 'IN_PROGRESS',
+      id: { not: startingPoolId },
+    },
+    select: { id: true },
+  });
+
+  if (activeRide) {
+    throw AppError.conflict('Driver already has an active ride');
+  }
+};
+
+/**
  * Starts a pool: `OPEN -> IN_PROGRESS`, and every matched ride request in it
  * `MATCHED -> IN_PROGRESS`.
  *
@@ -328,6 +392,18 @@ const findOwnPool = async (userId, poolId) => {
  * transition it did not take part in. The API cannot produce that state: the
  * matching step is the only writer of `PoolMember`, and it always leaves the
  * request `MATCHED`.
+ *
+ * Starting a pool is also the point at which the specification's "a driver has
+ * one active ride at a time" rule applies, so the transition is refused with a
+ * 409 when the driver already has a ride in progress. That check runs inside this
+ * transaction, behind the driver row lock, rather than as a pre-flight read next
+ * to the `OPEN` check above: it is the only way the check and the transition see
+ * the same picture when two starts race each other. Locking before reading means
+ * a losing racer blocks until the winner has committed, and then reads the
+ * `IN_PROGRESS` row that the winner wrote.
+ *
+ * Both guards raise before any write, so a refused start leaves this pool `OPEN`,
+ * every member `MATCHED`, and the driver's existing ride untouched.
  */
 export const startPool = async (userId, poolId) => {
   const pool = await findOwnPool(userId, poolId);
@@ -339,6 +415,9 @@ export const startPool = async (userId, poolId) => {
   const startedAt = new Date();
 
   const started = await prisma.$transaction(async (tx) => {
+    await lockDriverForActiveRide(tx, pool.driverId);
+    await assertNoOtherActiveRide(tx, pool.driverId, pool.id);
+
     const { count } = await tx.pool.updateMany({
       where: {
         id: pool.id,

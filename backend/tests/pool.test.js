@@ -1363,6 +1363,166 @@ describe('PATCH /api/pools/:poolId/start', () => {
     expect(stored.status).toBe('IN_PROGRESS');
     expect(stored.completedAt).toBeNull();
   });
+
+  describe('one active ride per driver', () => {
+    /**
+     * Puts the driver under test in the state the rule is about: one pool already
+     * on the road, and `secondPoolId` staged as `OPEN` and ready to be started.
+     */
+    const driverWithRideInProgress = async () => {
+      await startPool(token, poolId);
+      const { id: secondPoolId } = (await createPool(token)).body.data.pool;
+
+      return secondPoolId;
+    };
+
+    it('refuses to start a second pool while one is IN_PROGRESS', async () => {
+      const secondPoolId = await driverWithRideInProgress();
+
+      const response = await startPool(token, secondPoolId);
+
+      expect(response.status).toBe(409);
+      expect(response.body).toMatchObject({
+        success: false,
+        message: 'Driver already has an active ride',
+      });
+      expect(response.body.data).toBeUndefined();
+    });
+
+    it('leaves the refused pool OPEN and the running ride untouched', async () => {
+      const secondPoolId = await driverWithRideInProgress();
+      const runningBefore = await prisma.pool.findUnique({ where: { id: poolId } });
+
+      await startPool(token, secondPoolId);
+
+      const refused = await prisma.pool.findUnique({ where: { id: secondPoolId } });
+      expect(refused.status).toBe('OPEN');
+      expect(refused.startedAt).toBeNull();
+
+      const runningAfter = await prisma.pool.findUnique({ where: { id: poolId } });
+      expect(runningAfter.status).toBe('IN_PROGRESS');
+      expect(runningAfter.startedAt).toEqual(runningBefore.startedAt);
+    });
+
+    it('leaves matched members of the refused pool untouched', async () => {
+      const { id: secondPoolId } = (await createPool(token)).body.data.pool;
+      const [{ rideRequest, poolMember }] = await matchRideRequests(token, secondPoolId, 1);
+      const memberBefore = await prisma.poolMember.findFirst({ where: { poolId: secondPoolId } });
+
+      await startPool(token, poolId);
+      await startPool(token, secondPoolId);
+
+      const request = await prisma.rideRequest.findUnique({ where: { id: rideRequest.id } });
+      expect(request.status).toBe('MATCHED');
+
+      const memberAfter = await prisma.poolMember.findFirst({ where: { poolId: secondPoolId } });
+      expect(memberAfter).toEqual(memberBefore);
+      expect(memberAfter.seats).toBe(poolMember.seats);
+      expect(memberAfter.farePaisa).toBe(poolMember.farePaisa);
+    });
+
+    it('lets the driver start a new ride once the previous one is COMPLETED', async () => {
+      const secondPoolId = await driverWithRideInProgress();
+
+      const completed = await completePool(token, poolId);
+      expect(completed.status).toBe(200);
+
+      const response = await startPool(token, secondPoolId);
+
+      expect(response.status).toBe(200);
+      expect(response.body.data.pool).toMatchObject({ id: secondPoolId, status: 'IN_PROGRESS' });
+    });
+
+    it('lets the driver start a new ride once the previous one is CANCELLED', async () => {
+      const secondPoolId = await driverWithRideInProgress();
+      await prisma.pool.update({ where: { id: poolId }, data: { status: 'CANCELLED' } });
+
+      const response = await startPool(token, secondPoolId);
+
+      expect(response.status).toBe(200);
+      expect(response.body.data.pool).toMatchObject({ id: secondPoolId, status: 'IN_PROGRESS' });
+    });
+
+    it('lets the driver start one of two OPEN pools, since OPEN is not a ride', async () => {
+      const { id: secondPoolId } = (await createPool(token)).body.data.pool;
+
+      const response = await startPool(token, secondPoolId);
+
+      expect(response.status).toBe(200);
+      expect(response.body.data.pool).toMatchObject({ id: secondPoolId, status: 'IN_PROGRESS' });
+    });
+
+    it('does not block a second driver who is riding at the same time', async () => {
+      const { token: otherToken, otherPoolId } = await otherDriverWithPool();
+
+      await startPool(token, poolId);
+
+      const response = await startPool(otherToken, otherPoolId);
+
+      expect(response.status).toBe(200);
+      expect(response.body.data.pool).toMatchObject({ id: otherPoolId, status: 'IN_PROGRESS' });
+    });
+
+    it('rejects a concurrent start of two pools with exactly one 200', async () => {
+      const { id: secondPoolId } = (await createPool(token)).body.data.pool;
+
+      // Two starts for the same driver contend on the driver row lock, so one
+      // waits for the other to commit and then sees the ride the winner started.
+      const responses = await Promise.all([
+        startPool(token, poolId),
+        startPool(token, secondPoolId),
+      ]);
+
+      const statuses = responses.map((response) => response.status).sort();
+      expect(statuses).toEqual([200, 409]);
+
+      const failed = responses.find((response) => response.status === 409);
+      expect(failed.body.message).toBe('Driver already has an active ride');
+
+      const stored = await prisma.pool.findMany({ where: { id: { in: [poolId, secondPoolId] } } });
+      const inProgress = stored.filter((pool) => pool.status === 'IN_PROGRESS');
+      expect(inProgress).toHaveLength(1);
+    });
+
+    it('reports the conflict when the rule is called straight on the service', async () => {
+      const secondPoolId = await driverWithRideInProgress();
+
+      // The rule is service-layer logic, so the guarantee has to hold for a
+      // direct call too, not only for a request that went through the controller.
+      await expect(startPoolForUser(userId, secondPoolId)).rejects.toMatchObject({
+        statusCode: 409,
+        message: 'Driver already has an active ride',
+      });
+    });
+
+    it('keeps the rule per driver when two drivers start concurrently', async () => {
+      const other = await otherDriverWithPool();
+
+      const responses = await Promise.all([
+        startPool(token, poolId),
+        startPool(other.token, other.otherPoolId),
+      ]);
+
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 200]);
+
+      const stored = await prisma.pool.findMany({
+        where: { id: { in: [poolId, other.otherPoolId] } },
+      });
+      expect(stored.every((pool) => pool.status === 'IN_PROGRESS')).toBe(true);
+    });
+
+    it('still answers 404 for a pool belonging to another driver', async () => {
+      const { otherPoolId } = await otherDriverWithPool();
+      await startPool(token, poolId);
+
+      const response = await startPool(token, otherPoolId);
+
+      // The rule must not turn a foreign pool into a 409, which would confirm
+      // the pool id exists and hand one driver an oracle for others' ids.
+      expect(response.status).toBe(404);
+      expect(response.body.message).toBe('Pool not found');
+    });
+  });
 });
 
 describe('PATCH /api/pools/:poolId/complete', () => {
