@@ -101,3 +101,41 @@ export const createDriverProfile = async (userId, vehicle) => {
     throw error;
   }
 };
+
+/**
+ * Records whether the authenticated driver is available to take passengers.
+ *
+ * This is the only place `DriverProfile.status` is ever written after onboarding.
+ * Onboarding deliberately leaves it at the Prisma default of `OFFLINE` (see
+ * `createDriverProfile` above), so a driver is never online before they say so,
+ * and this endpoint is where they say it.
+ *
+ * The profile is found by the `userId` in the verified access token, never by an
+ * id from the request. That is the whole reason a driver cannot set somebody
+ * else's availability: the row is chosen from the token, so a client that sends
+ * `userId` or `driverId` is not naming anything the update uses. No other field
+ * is written, so a caller cannot smuggle anything else onto the row either.
+ *
+ * Onboarding is a prerequisite rather than something to work around, exactly as
+ * in the four pool endpoints: a driver with no `DriverProfile` has no row to
+ * update, so it gets the same 404 that names what is missing.
+ *
+ * The `tesla` relation is read so the response is the same `toDriverProfile`
+ * shape as onboarding, which keeps one DTO for the entity instead of two
+ * partial ones that drift apart.
+ */
+export const setDriverAvailability = async (userId, status) => {
+  const driverProfile = await prisma.driverProfile.findUnique({ where: { userId } });
+
+  if (!driverProfile) {
+    throw AppError.notFound('Driver profile not found');
+  }
+
+  const updated = await prisma.driverProfile.update({
+    where: { id: driverProfile.id },
+    data: { status },
+    include: { tesla: true },
+  });
+
+  return toDriverProfile(updated);
+};

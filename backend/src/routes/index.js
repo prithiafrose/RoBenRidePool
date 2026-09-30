@@ -1,5 +1,6 @@
 import { Router } from 'express';
 
+import availabilityRoutes from './availability.routes.js';
 import authRoutes from './auth.routes.js';
 import driverProfileRoutes from './driverProfile.routes.js';
 import healthRoutes from './health.routes.js';
@@ -14,6 +15,7 @@ const router = Router();
  * import and then by mount, for example `router.use('/payments', paymentRoutes)`.
  */
 router.use('/health', healthRoutes);
+router.use('/availability', availabilityRoutes);
 router.use('/auth', authRoutes);
 router.use('/driver-profile', driverProfileRoutes);
 router.use('/pools', poolRoutes);
