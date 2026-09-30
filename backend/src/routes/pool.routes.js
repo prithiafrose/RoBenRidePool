@@ -1,6 +1,6 @@
 import { Router } from 'express';
 
-import { addMember, complete, create, start } from '../controllers/pool.controller.js';
+import { addMember, complete, create, list, start } from '../controllers/pool.controller.js';
 import { authenticate } from '../middleware/auth.middleware.js';
 import { requireRole } from '../middleware/role.middleware.js';
 import { validateBody, validateParams } from '../middleware/validate.middleware.js';
@@ -12,6 +12,10 @@ import {
 } from '../validators/pool.validator.js';
 
 const router = Router();
+
+// Collection route mounted first, mirroring `rideRequest.routes.js`: it reads no
+// params and no body, so it needs neither `validateParams` nor `validateBody`.
+router.get('/', authenticate, requireRole('DRIVER'), list);
 
 router.post('/', authenticate, requireRole('DRIVER'), validateBody(createPoolSchema), create);
 

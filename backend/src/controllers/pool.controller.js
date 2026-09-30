@@ -1,4 +1,4 @@
-import { addPoolMember, completePool, createPool, startPool } from '../services/pool.service.js';
+import { addPoolMember, completePool, createPool, listPools, startPool } from '../services/pool.service.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 
 /** POST /api/pools (protected by `authenticate` and `requireRole`) */
@@ -8,6 +8,15 @@ export const create = async (req, res) => {
   const pool = await createPool(req.user.id);
 
   return sendSuccess(res, { pool }, 201, 'Pool created successfully');
+};
+
+/** GET /api/pools (protected by `authenticate` and `requireRole`) */
+export const list = async (req, res) => {
+  // `req.user.id` is the only input. There is no body, query or params to
+  // forward, so the `driverId` the service filters on cannot be supplied here.
+  const pools = await listPools(req.user.id);
+
+  return sendSuccess(res, { pools }, 200, 'Pools retrieved successfully');
 };
 
 /** POST /api/pools/:poolId/members (protected by `authenticate` and `requireRole`) */

@@ -65,6 +65,8 @@ const createPool = (token, payload) => {
   return payload === undefined ? req : req.send(payload);
 };
 
+const listPools = (token) => request(app).get('/api/pools').set('Authorization', `Bearer ${token}`);
+
 const rideRequestPayload = {
   pickupArea: 'Dhanmondi',
   destinationArea: 'Gulshan',
@@ -387,6 +389,212 @@ describe('POST /api/pools', () => {
 
     const stored = await prisma.pool.findUnique({ where: { id: first.id } });
     expect(stored.status).toBe('OPEN');
+  });
+});
+
+describe('GET /api/pools', () => {
+  let token;
+  let driverProfileId;
+  let teslaId;
+
+  beforeEach(async () => {
+    ({ token, driverProfileId, teslaId } = await onboardedDriver());
+  });
+
+  /** Opens `count` pools for the driver under test, in creation order. */
+  const createSeveralPools = async (count) => {
+    const pools = [];
+
+    for (let index = 0; index < count; index += 1) {
+      const { body } = await createPool(token);
+      pools.push(body.data.pool);
+    }
+
+    return pools;
+  };
+
+  it('returns an empty list for an onboarded driver with no pools', async () => {
+    const response = await listPools(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      success: true,
+      message: 'Pools retrieved successfully',
+    });
+    expect(response.body.data.pools).toEqual([]);
+  });
+
+  it("returns the driver's own pools", async () => {
+    const [created] = await createSeveralPools(1);
+
+    const response = await listPools(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pools).toHaveLength(1);
+    expect(response.body.data.pools[0]).toMatchObject({
+      id: created.id,
+      driverId: driverProfileId,
+      vehicleId: teslaId,
+      status: 'OPEN',
+      startedAt: null,
+      completedAt: null,
+    });
+  });
+
+  it("never returns another driver's pools", async () => {
+    await createSeveralPools(2);
+    const { token: otherToken, otherPoolId } = await otherDriverWithPool();
+
+    const response = await listPools(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pools).toHaveLength(2);
+
+    for (const pool of response.body.data.pools) {
+      expect(pool.driverId).toBe(driverProfileId);
+    }
+
+    expect(response.body.data.pools.map((pool) => pool.id)).not.toContain(otherPoolId);
+
+    // The other driver really does have a pool, so the assertion above is not
+    // passing just because this list happens to be empty or short.
+    const otherList = await listPools(otherToken);
+    expect(otherList.body.data.pools.map((pool) => pool.id)).toContain(otherPoolId);
+  });
+
+  it('lets a second driver see their own pool and nothing else', async () => {
+    const [mine] = await createSeveralPools(1);
+    const { token: otherToken, driverProfileId: otherProfileId, otherPoolId } =
+      await otherDriverWithPool();
+
+    const response = await listPools(otherToken);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pools).toHaveLength(1);
+    expect(response.body.data.pools[0]).toMatchObject({
+      id: otherPoolId,
+      driverId: otherProfileId,
+    });
+    expect(response.body.data.pools.map((pool) => pool.id)).not.toContain(mine.id);
+  });
+
+  it('returns the newest pool first', async () => {
+    const created = await createSeveralPools(3);
+
+    const response = await listPools(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pools).toHaveLength(3);
+
+    const timestamps = response.body.data.pools.map((pool) => new Date(pool.createdAt).getTime());
+
+    for (let index = 1; index < timestamps.length; index += 1) {
+      expect(timestamps[index]).toBeLessThanOrEqual(timestamps[index - 1]);
+    }
+
+    // The last pool created is the newest, so it must come first.
+    expect(response.body.data.pools[0].id).toBe(created.at(-1).id);
+  });
+
+  it('lists an OPEN pool with no lifecycle timestamps', async () => {
+    const { id: poolId } = (await createPool(token)).body.data.pool;
+
+    const response = await listPools(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pools).toHaveLength(1);
+    expect(response.body.data.pools[0]).toMatchObject({
+      id: poolId,
+      status: 'OPEN',
+      startedAt: null,
+      completedAt: null,
+    });
+  });
+
+  it('lists an IN_PROGRESS pool with a start timestamp and no completion one', async () => {
+    const { id: poolId } = (await createPool(token)).body.data.pool;
+    await startPool(token, poolId);
+
+    const response = await listPools(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pools).toHaveLength(1);
+    expect(response.body.data.pools[0]).toMatchObject({ id: poolId, status: 'IN_PROGRESS' });
+    expect(response.body.data.pools[0].startedAt).not.toBeNull();
+    expect(response.body.data.pools[0].completedAt).toBeNull();
+  });
+
+  it('lists a COMPLETED pool with both lifecycle timestamps', async () => {
+    const { id: poolId } = (await createPool(token)).body.data.pool;
+    await startPool(token, poolId);
+    await completePool(token, poolId);
+
+    const response = await listPools(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pools).toHaveLength(1);
+    expect(response.body.data.pools[0]).toMatchObject({ id: poolId, status: 'COMPLETED' });
+    expect(response.body.data.pools[0].startedAt).not.toBeNull();
+    expect(response.body.data.pools[0].completedAt).not.toBeNull();
+  });
+
+  it('never exposes the driver, the vehicle or the members of a pool', async () => {
+    const { id: poolId } = (await createPool(token)).body.data.pool;
+    await matchRideRequests(token, poolId, 1);
+
+    // The pool really does have a driver, a vehicle and a member, so the
+    // assertions below are not passing because the relations happen to be
+    // empty. `passwordHash` lives on the driver through the `driver` relation.
+    const stored = await prisma.pool.findUnique({
+      where: { id: poolId },
+      include: { driver: true, vehicle: true, members: true },
+    });
+
+    expect(stored.driver).not.toBeNull();
+    expect(stored.vehicle).not.toBeNull();
+    expect(stored.members).toHaveLength(1);
+
+    const response = await listPools(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pools).toHaveLength(1);
+
+    const pool = response.body.data.pools[0];
+    expect(pool).not.toHaveProperty('driver');
+    expect(pool).not.toHaveProperty('vehicle');
+    expect(pool).not.toHaveProperty('members');
+
+    const serialized = JSON.stringify(response.body);
+    expect(serialized).not.toContain('passwordHash');
+    expect(serialized).not.toContain(driver.password);
+    expect(serialized).not.toContain(vehicle.plateNumber);
+  });
+
+  it('returns 404 for a driver who has not onboarded', async () => {
+    const { token: fresh } = await authenticate({ email: 'newdriver@example.com' });
+
+    const response = await listPools(fresh);
+
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({ success: false, message: 'Driver profile not found' });
+  });
+
+  it('requires authentication', async () => {
+    const response = await request(app).get('/api/pools');
+
+    expect(response.status).toBe(401);
+    expect(response.body.success).toBe(false);
+    expect(await prisma.pool.count()).toBe(0);
+  });
+
+  it('rejects a passenger', async () => {
+    const { token: passengerToken } = await passengerWithRideRequest();
+
+    const response = await listPools(passengerToken);
+
+    expect(response.status).toBe(403);
+    expect(response.body.message).toBe('You do not have permission to perform this action');
+    expect(await prisma.pool.count()).toBe(0);
   });
 });
 

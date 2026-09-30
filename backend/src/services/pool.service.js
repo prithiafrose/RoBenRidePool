@@ -66,6 +66,41 @@ export const createPool = async (userId) => {
   return toPool(pool);
 };
 
+/**
+ * Lists one driver's pools, newest first.
+ *
+ * Scoped to the authenticated driver only: `driverId` comes from the
+ * `DriverProfile` looked up by the user id in the access token, never from the
+ * request. This endpoint reads no body, no query string and no path parameter,
+ * so that guarantee is structural rather than a matter of ignoring what was
+ * sent: there is no channel through which a client could name a `driverId`.
+ *
+ * The `driverId, status` index on `pools` serves this filter. The
+ * `createdAt: 'desc'` ordering is not a suffix of that index, so Postgres
+ * filters through the index and sorts what is left, which is plenty at MVP
+ * volume.
+ *
+ * Onboarding is treated as a prerequisite, exactly as in `createPool`: a driver
+ * without a `DriverProfile` has no `driverId` to filter on and gets the same
+ * 404. Returning an empty array instead would be indistinguishable from an
+ * onboarded driver who has not opened a pool yet. That onboarded-but-no-pools
+ * case is a normal outcome and returns an empty array.
+ */
+export const listPools = async (userId) => {
+  const driverProfile = await prisma.driverProfile.findUnique({ where: { userId } });
+
+  if (!driverProfile) {
+    throw AppError.notFound('Driver profile not found');
+  }
+
+  const pools = await prisma.pool.findMany({
+    where: { driverId: driverProfile.id },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  return pools.map(toPool);
+};
+
 /** Fields safe to return for a membership. No relations are selected at all. */
 const toPoolMember = (poolMember) => ({
   id: poolMember.id,
