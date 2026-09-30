@@ -3,9 +3,53 @@
 @theme inline {
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+
+  /* Two elevations, so a card and something lifted off the page are the only
+     two depths in the system instead of an ad-hoc `shadow-sm` per component. */
+  --shadow-card: 0 1px 2px 0 rgb(15 23 42 / 0.04), 0 1px 3px 0 rgb(15 23 42 / 0.06);
+  --shadow-raised: 0 10px 15px -3px rgb(15 23 42 / 0.08), 0 4px 6px -4px
+    rgb(15 23 42 / 0.05);
 }
 
-body {
-  background-color: #f8fafc;
-  color: #0f172a;
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  body {
+    background-color: var(--color-slate-50);
+    color: var(--color-slate-900);
+  }
+
+  ::selection {
+    background-color: var(--color-slate-900);
+    color: var(--color-slate-50);
+  }
+
+  /* One focus ring for the whole app, defined once instead of per component.
+     `:where()` keeps specificity at zero so a component can still override it.
+     This is why the inputs no longer carry their own `outline-none`. */
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-slate-900);
+    outline-offset: 2px;
+  }
+
+  input,
+  select,
+  textarea {
+    accent-color: var(--color-slate-900);
+  }
+
+  /* The spinner and the hover transitions both animate. Someone who has asked
+     the OS to reduce motion should get neither. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
 }

@@ -1,64 +1,67 @@
 "use client";
 
-/** Shared input styling for every auth form field. */
-const inputClass =
-  "w-full rounded-lg border border-slate-300 px-3 py-2 text-sm shadow-sm outline-none transition focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 disabled:bg-slate-100";
-
-const labelClass = "mb-1 block text-sm font-medium text-slate-700";
-
-const fieldErrorClass = "mt-1 text-xs text-rose-600";
+import { Alert, Button, Field } from "./ui";
+import { Icon } from "./icons";
 
 /**
- * Presentational form pieces shared by the login and register pages. Keeping
- * them here avoids duplicating the loading / error markup twice.
+ * Presentational form pieces shared by the login and register pages.
+ *
+ * These are thin wrappers over `ui.js` rather than a second set of styles. An
+ * earlier version kept its own `inputClass`, `labelClass` and error text, which
+ * meant the auth forms were subtly out of step with every other form in the app -
+ * a different height, a different error colour, a focus ring that only existed
+ * here. Delegating means there is one control style and one focus treatment.
  */
-export function FormField({ label, name, type = "text", value, onChange, error, ...props }) {
-  return (
-    <div>
-      <label className={labelClass} htmlFor={name}>
-        {label}
-      </label>
-      <input
-        id={name}
-        name={name}
-        type={type}
-        value={value}
-        onChange={onChange}
-        aria-invalid={Boolean(error)}
-        aria-describedby={error ? `${name}-error` : undefined}
-        className={inputClass}
-        {...props}
-      />
-      {error ? (
-        <p className={fieldErrorClass} id={`${name}-error`}>
-          {error}
-        </p>
-      ) : null}
-    </div>
-  );
+
+export function FormField({ label, name, error, hint, ...props }) {
+  return <Field label={label} name={name} error={error} hint={hint} {...props} />;
 }
 
-export function RoleSelector({ value, onChange, error, disabled }) {
-  const options = [
-    { value: "PASSENGER", label: "Passenger", hint: "Join a shared ride" },
-    { value: "DRIVER", label: "Driver", hint: "Offer seats and earn" },
-  ];
+const ROLES = [
+  {
+    value: "PASSENGER",
+    label: "Passenger",
+    hint: "Join a shared ride",
+    icon: "user",
+  },
+  {
+    value: "DRIVER",
+    label: "Driver",
+    hint: "Offer seats and earn",
+    icon: "car",
+  },
+];
 
+/**
+ * The passenger-or-driver choice.
+ *
+ * Two large targets rather than a `<select>`, because it is the one decision on
+ * the register form that determines what the account can do, and it is worth
+ * showing both consequences. Real radios underneath, so it is still one control
+ * to the keyboard rather than a pair of styled divs - and because the radios are
+ * `sr-only`, the focus ring is repeated on the label via `has-[:focus-visible]`.
+ */
+export function RoleSelector({ value, onChange, error, disabled }) {
   return (
     <fieldset disabled={disabled}>
-      <legend className={labelClass}>I want to join as</legend>
+      <legend className="mb-1.5 block text-sm font-medium text-slate-700">
+        I want to join as
+      </legend>
+
       <div className="grid grid-cols-2 gap-3">
-        {options.map((option) => {
+        {ROLES.map((option) => {
           const isSelected = value === option.value;
 
           return (
             <label
               key={option.value}
-              className={`cursor-pointer rounded-lg border px-4 py-3 transition ${
-                isSelected
-                  ? "border-slate-900 bg-slate-900 text-white"
-                  : "border-slate-300 bg-white text-slate-700 hover:border-slate-400"
-              } ${disabled ? "cursor-not-allowed opacity-60" : ""}`}
+              className={`flex cursor-pointer flex-col gap-1 rounded-lg border px-4 py-3.5 transition
+                has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-slate-900
+                ${
+                  isSelected
+                    ? "border-slate-900 bg-slate-900 text-white"
+                    : "border-slate-300 bg-white text-slate-700 hover:border-slate-400 hover:bg-slate-50"
+                } ${disabled ? "cursor-not-allowed opacity-60" : ""}`}
             >
               <input
                 type="radio"
@@ -68,9 +71,13 @@ export function RoleSelector({ value, onChange, error, disabled }) {
                 onChange={() => onChange(option.value)}
                 className="sr-only"
               />
-              <span className="block text-sm font-semibold">{option.label}</span>
+
+              <span className="flex items-center gap-2">
+                <Icon name={option.icon} className="h-4 w-4" />
+                <span className="text-sm font-semibold">{option.label}</span>
+              </span>
               <span
-                className={`block text-xs ${isSelected ? "text-slate-300" : "text-slate-500"}`}
+                className={`text-xs ${isSelected ? "text-slate-300" : "text-slate-500"}`}
               >
                 {option.hint}
               </span>
@@ -78,32 +85,25 @@ export function RoleSelector({ value, onChange, error, disabled }) {
           );
         })}
       </div>
-      {error ? <p className={fieldErrorClass}>{error}</p> : null}
+
+      {error ? (
+        <p className="mt-1.5 flex items-start gap-1 text-xs text-rose-600">
+          <Icon name="alert" className="mt-px h-3.5 w-3.5 shrink-0" />
+          <span>{error}</span>
+        </p>
+      ) : null}
     </fieldset>
   );
 }
 
 export function FormAlert({ children }) {
-  if (!children) return null;
-
-  return (
-    <div
-      role="alert"
-      className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700"
-    >
-      {children}
-    </div>
-  );
+  return <Alert tone="error">{children}</Alert>;
 }
 
 export function SubmitButton({ isLoading, children }) {
   return (
-    <button
-      type="submit"
-      disabled={isLoading}
-      className="w-full rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
-    >
-      {isLoading ? "Please wait..." : children}
-    </button>
+    <Button type="submit" isLoading={isLoading} className="w-full py-2.5 font-semibold">
+      {children}
+    </Button>
   );
 }

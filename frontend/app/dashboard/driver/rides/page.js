@@ -3,7 +3,16 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
-import { Alert, Button, Detail, EmptyState, Panel, Pending, Select } from "../../../../components/ui";
+import {
+  Alert,
+  Button,
+  Detail,
+  EmptyState,
+  PageHeader,
+  Panel,
+  Pending,
+  Select,
+} from "../../../../components/ui";
 import { Protected, useSession } from "../../../../hooks/use-session";
 import {
   acceptRideRequest,
@@ -103,12 +112,10 @@ function RideQueue() {
   if (notOnboarded) {
     return (
       <div className="space-y-6">
-        <header>
-          <h1 className="text-2xl font-bold tracking-tight">Ride queue</h1>
-          <p className="mt-1 text-sm text-slate-600">
-            Waiting requests, longest waited first. Accept one into a pool, or decline it.
-          </p>
-        </header>
+        <PageHeader
+          title="Ride queue"
+          description="Waiting requests, longest waited first. Accept one into a pool, or decline it."
+        />
 
         <Panel
           title="Finish setting up first"
@@ -131,12 +138,10 @@ function RideQueue() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold tracking-tight">Ride queue</h1>
-        <p className="mt-1 text-sm text-slate-600">
-          Waiting requests, longest waited first. Accept one into a pool, or decline it.
-        </p>
-      </header>
+      <PageHeader
+        title="Ride queue"
+        description="Waiting requests, longest waited first. Accept one into a pool, or decline it."
+      />
 
       <Panel
         title="Accepting into"

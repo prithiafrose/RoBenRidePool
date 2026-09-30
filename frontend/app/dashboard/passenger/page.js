@@ -2,7 +2,18 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-import { Alert, Button, Detail, EmptyState, Field, Panel, Pending, ScorePicker, StatusBadge } from "../../../components/ui";
+import {
+  Alert,
+  Button,
+  Detail,
+  EmptyState,
+  Field,
+  PageHeader,
+  Panel,
+  Pending,
+  ScorePicker,
+  StatusBadge,
+} from "../../../components/ui";
 import { Protected, useSession } from "../../../hooks/use-session";
 import {
   cancelRideRequest,
@@ -62,12 +73,10 @@ function PassengerDashboardView() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold tracking-tight">My rides</h1>
-        <p className="mt-1 text-sm text-slate-600">
-          Request a shared ride, then follow it until it is finished.
-        </p>
-      </header>
+      <PageHeader
+        title="My rides"
+        description="Request a shared ride, then follow it until it is finished."
+      />
 
       <RequestForm onCreated={load} />
 

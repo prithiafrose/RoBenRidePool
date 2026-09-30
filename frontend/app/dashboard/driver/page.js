@@ -10,6 +10,7 @@ import {
   EmptyState,
   Field,
   Panel,
+  PageHeader,
   Pending,
   StatusBadge,
 } from "../../../components/ui";
@@ -131,12 +132,10 @@ function DriverDashboardView() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold tracking-tight">Driver overview</h1>
-        <p className="mt-1 text-sm text-slate-600">
-          Open a pool for the hours you are driving, then fill it from the ride queue.
-        </p>
-      </header>
+      <PageHeader
+        title="Driver overview"
+        description="Open a pool for the hours you are driving, then fill it from the ride queue."
+      />
 
       <AvailabilityPanel profile={profile} onChanged={loadProfile} />
 

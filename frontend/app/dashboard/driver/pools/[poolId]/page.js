@@ -4,12 +4,15 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
+import { Icon } from "../../../../../components/icons";
+
 import {
   Alert,
   Button,
   Detail,
   EmptyState,
   Panel,
+  PageHeader,
   Pending,
   ScorePicker,
   StatusBadge,
@@ -115,21 +118,23 @@ function PoolDetail() {
 
   return (
     <div className="space-y-6">
-      <header className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <Link href="/dashboard/driver" className="text-sm text-slate-600 underline underline-offset-2">
-            Back to your pools
-          </Link>
-          <h1 className="mt-2 text-2xl font-bold tracking-tight">
-            {formatWindow(pool.departureFrom, pool.departureTo)}
-          </h1>
-        </div>
+      <Link
+        href="/dashboard/driver"
+        className="inline-flex items-center gap-1.5 rounded text-sm font-medium text-slate-600 transition hover:text-slate-900"
+      >
+        <Icon name="arrowLeft" className="h-3.5 w-3.5" />
+        Back to your pools
+      </Link>
 
-        <StatusBadge
-          value={pool.status}
-          label={POOL_STATUS_LABELS[pool.status] ?? pool.status}
-        />
-      </header>
+      <PageHeader
+        title={formatWindow(pool.departureFrom, pool.departureTo)}
+        actions={
+          <StatusBadge
+            value={pool.status}
+            label={POOL_STATUS_LABELS[pool.status] ?? pool.status}
+          />
+        }
+      />
 
       <Panel title="This ride">
         <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
