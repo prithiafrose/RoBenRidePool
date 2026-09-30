@@ -505,12 +505,32 @@ for each. It prints one line per step and exits non-zero if any fail.
 
 ```bash
 cd frontend
-npm run build
+npm run lint     # ESLint, standalone
+npm run build    # lint, then next build
 ```
 
-There is no ESLint or TypeScript configured in this project, so `next build` is
-the gate: it compiles every route and prerenders them, which is what catches
-import, syntax and client/server boundary errors.
+`npm run build` runs the linter first, so an error fails the build.
+
+**Why the linter is part of the build.** A client-side render bug is invisible to
+every other gate in this project, and that was demonstrated the hard way: the
+passenger dashboard shipped with `useCallback(fn, [user])` in a component that
+destructured only `{ token }`. The dependency array is evaluated during render, so
+`user is not defined` threw a `ReferenceError` on the first render and blanked the
+page for every passenger - while `next build` stayed green, all 417 backend tests
+passed, and all 41 end-to-end steps passed, because none of them execute React.
+
+`no-undef` is the rule that catches it, and it is what `npm run lint` runs first.
+There is no TypeScript in this project, so nothing else was checking.
+
+| Rule                                | Level   | Why                                                  |
+| ----------------------------------- | ------- | ---------------------------------------------------- |
+| `no-undef`                          | error   | Catches the crash class above before it ships        |
+| `react-hooks/exhaustive-deps`       | warning | A stale closure, the silent version of the same slip |
+| `react-hooks/set-state-in-effect`   | warning | The React Compiler's cascade-render advice; every data-loading panel in the app uses the documented `useEffect(() => load(), [load])` shape, so it fires in seven places. Downgraded rather than rewritten - see `eslint.config.mjs` |
+
+`next build` still does the job the linter cannot: it compiles and prerenders
+every route, which is what catches import, syntax and client/server boundary
+errors.
 
 ---
 
@@ -654,8 +674,10 @@ Notes:
   and the UI marks the verdict in advance, but the list itself is unfiltered.
 - A pool cannot be cancelled and an accepted request cannot be withdrawn: the only
   exit from `MATCHED` is completing the ride.
-- The frontend has no test coverage, and the project has no ESLint or TypeScript
-  configuration, so `next build` is the only frontend gate.
+- The frontend has no component or page tests. ESLint now gates the build, which
+  catches undefined identifiers, but nothing exercises a component render, so a
+  runtime-only React error would still reach a deployed page.
+- No TypeScript, so prop shapes and API payloads are not checked at compile time.
 - No CI pipeline and no structured logging.
 
 ## Planned features

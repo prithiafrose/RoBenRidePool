@@ -324,11 +324,19 @@ Domain-specific measures:
 | --------------------- | ------------------------------------ | --------------------------------------------- |
 | Backend suite         | `cd backend && npm test`             | 417 tests, integration against PostgreSQL      |
 | End-to-end walkthrough| `cd backend && node scripts/e2e-mvp.mjs` | 41 cross-role steps against a running API   |
-| Frontend build        | `cd frontend && npm run build`       | Compiles and prerenders all routes              |
+| Frontend build        | `cd frontend && npm run build`       | ESLint first, then compiles and prerenders all routes |
 
 The walkthrough needs the API running (`npm run dev` or `npm start` in
 `backend/`) and a reachable development database; it creates its own accounts
 with a unique suffix each run, so it is repeatable but not self-cleaning.
+
+### Why the frontend has a linter
+
+Everything else in this table is server-side, so none of it can see a React
+render. A `useCallback(fn, [user])` in a component that destructured only
+`{ token }` shipped once: `user is not defined` threw during render and blanked
+the passenger page, with the build green and all 458 server-side checks passing.
+`no-undef`, run before `next build`, is the gate for that class.
 
 ## 8. Not yet done
 

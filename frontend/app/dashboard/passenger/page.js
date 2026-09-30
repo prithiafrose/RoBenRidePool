@@ -54,7 +54,7 @@ function PassengerDashboardView() {
     } finally {
       setIsLoading(false);
     }
-  }, [user]);
+  }, [token]);
 
   useEffect(() => {
     load();

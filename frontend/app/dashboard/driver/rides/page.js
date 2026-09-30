@@ -44,6 +44,7 @@ function RideQueue() {
   const [requests, setRequests] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
+  const [notOnboarded, setNotOnboarded] = useState(false);
   const [notice, setNotice] = useState("");
 
   const load = useCallback(async () => {
@@ -59,6 +60,7 @@ function RideQueue() {
 
       setPools(openPools);
       setRequests(requestData.rideRequests);
+      setNotOnboarded(false);
 
       // Default to the first open pool, so the accept button is usable without a
       // trip to the selector first. Only set when nothing is already chosen: a
@@ -68,7 +70,18 @@ function RideQueue() {
         return openPools[0]?.id ?? "";
       });
     } catch (error) {
-      setLoadError(error.message);
+      // 404 from either endpoint is the API's "not onboarded yet", which is a
+      // state to render rather than a failure - there is no driver profile for
+      // either query to be scoped to. Everything else is a real error.
+      //
+      // Both endpoints resolve the profile from the token, so both fail the same
+      // way and one rejection is enough to tell; `Promise.all` discarding the
+      // second result does not lose information here.
+      if (error.status === 404) {
+        setNotOnboarded(true);
+      } else {
+        setLoadError(error.message);
+      }
     } finally {
       setIsLoading(false);
     }
@@ -79,6 +92,42 @@ function RideQueue() {
   }, [load]);
 
   const selectedPool = pools.find((pool) => pool.id === selectedPoolId) ?? null;
+
+  if (isLoading) {
+    return <Pending label="Loading the ride queue" />;
+  }
+
+  // Onboarding is a prerequisite for this page: there is no queue to show and no
+  // pool to accept into without a driver profile, so it is explained instead of
+  // rendered as empty lists.
+  if (notOnboarded) {
+    return (
+      <div className="space-y-6">
+        <header>
+          <h1 className="text-2xl font-bold tracking-tight">Ride queue</h1>
+          <p className="mt-1 text-sm text-slate-600">
+            Waiting requests, longest waited first. Accept one into a pool, or decline it.
+          </p>
+        </header>
+
+        <Panel
+          title="Finish setting up first"
+          description="A driver profile and a vehicle are needed before you can match rides."
+        >
+          <EmptyState title="You have not onboarded yet">
+            Add your plate and seat count, then come back here to accept or decline
+            requests.{" "}
+            <Link
+              href="/dashboard/driver"
+              className="underline underline-offset-2"
+            >
+              Set up your driver profile
+            </Link>
+          </EmptyState>
+        </Panel>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -93,15 +142,19 @@ function RideQueue() {
         title="Accepting into"
         description="Only open pools can take members. A pool with no room or a window that does not overlap is refused by the API."
       >
-        {pools.length === 0 ? (
-          <EmptyState title="No open pools">
-            <Link
-              href="/dashboard/driver"
-              className="underline underline-offset-2"
-            >
-              Open a pool
-            </Link>{" "}
-            first - a ride is accepted into a pool, not on its own.
+        {loadError || pools.length === 0 ? (
+          <EmptyState title={loadError ? "Pools unavailable" : "No open pools"}>
+            {loadError ? null : (
+              <>
+                <Link
+                  href="/dashboard/driver"
+                  className="underline underline-offset-2"
+                >
+                  Open a pool
+                </Link>{" "}
+                first - a ride is accepted into a pool, not on its own.
+              </>
+            )}
           </EmptyState>
         ) : (
           <Select
@@ -144,9 +197,7 @@ function RideQueue() {
           </Link>
         }
       >
-        {isLoading ? <Pending label="Loading the queue" /> : null}
-
-        {!isLoading && loadError ? (
+        {loadError ? (
           <Alert tone="error">
             {loadError}
             <button type="button" onClick={load} className="ml-2 underline underline-offset-2">
@@ -159,13 +210,13 @@ function RideQueue() {
           {notice}
         </Alert>
 
-        {!isLoading && !loadError && requests.length === 0 ? (
+        {!loadError && requests.length === 0 ? (
           <EmptyState title="Nothing waiting">
             New passenger requests will appear here.
           </EmptyState>
         ) : null}
 
-        {!isLoading && !loadError && requests.length > 0 ? (
+        {!loadError && requests.length > 0 ? (
           <ul className="space-y-4">
             {requests.map((rideRequest) => (
               <RequestRow
