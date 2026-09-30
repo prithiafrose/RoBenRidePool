@@ -24,12 +24,12 @@ const vehicle = {
  * hard-coded, because `departureFrom` must not be in the past and a literal
  * would start failing the day it went by.
  */
-const futureWindow = (hoursFromNow = 24) => {
+const futureWindow = (hoursFromNow = 24, hours = 1) => {
   const departureFrom = new Date(Date.now() + hoursFromNow * 3_600_000);
 
   return {
     departureFrom: departureFrom.toISOString(),
-    departureTo: new Date(departureFrom.getTime() + 3_600_000).toISOString(),
+    departureTo: new Date(departureFrom.getTime() + hours * 3_600_000).toISOString(),
   };
 };
 
@@ -85,8 +85,17 @@ const passengerWithRideRequest = async (overrides = {}) => {
   return { token, userId, rideRequest: body.data.rideRequest };
 };
 
-const createPool = (token) =>
-  request(app).post('/api/pools').set('Authorization', `Bearer ${token}`);
+/**
+ * Opens a pool with a departure window that overlaps `rideRequestPayload`'s, so
+ * the member can be accepted. Pool creation requires the window; these tests are
+ * about rating rules, so the window is only here to get them past the matching
+ * step.
+ */
+const createPool = (token, payload = {}) =>
+  request(app)
+    .post('/api/pools')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ ...futureWindow(24, 2), ...payload });
 
 const addMember = (token, poolId, rideRequestId) =>
   request(app)
@@ -170,6 +179,12 @@ const selfRatingPool = async () => {
     data: {
       driverId: driverProfile.id,
       vehicleId: tesla.id,
+      // `Pool.departureFrom`/`departureTo` are required columns. This pool is
+      // written straight through Prisma to set up a state the API cannot produce
+      // - one account being both the driver and the passenger - so it reuses the
+      // ride request's own window instead of inventing a second one.
+      departureFrom: rideRequest.departureFrom,
+      departureTo: rideRequest.departureTo,
       status: 'COMPLETED',
       startedAt: new Date(),
       completedAt: new Date(),

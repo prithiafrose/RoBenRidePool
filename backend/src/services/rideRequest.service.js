@@ -1,4 +1,7 @@
+import { Prisma } from '@prisma/client';
+
 import { prisma } from '../config/prisma.js';
+import { toRideRequest } from './rideRequest.mapper.js';
 import { AppError } from '../utils/AppError.js';
 
 /**
@@ -33,27 +36,31 @@ const calculateEstimatedFarePaisa = ({ pickupArea, destinationArea, seatsRequest
 };
 
 /**
- * Fields safe to return. The `passenger` relation is deliberately not exposed,
- * which keeps `passwordHash` and the rest of the user record out of the
- * response without having to enumerate what must be hidden.
+ * The relation tree every *read* of a ride request selects.
+ *
+ * A read has to carry the matched pool because the MVP requires a passenger to be
+ * able to see the pool they were accepted into; `createRideRequest` does not use
+ * it, since a brand-new request is `WAITING` by definition. Sharing the include
+ * here is what keeps a driver's view of a member's request and the passenger's own
+ * view of it built from identical projections.
  */
-const toRideRequest = (rideRequest) => ({
-  id: rideRequest.id,
-  passengerId: rideRequest.passengerId,
-  pickupArea: rideRequest.pickupArea,
-  pickupLat: rideRequest.pickupLat,
-  pickupLng: rideRequest.pickupLng,
-  destinationArea: rideRequest.destinationArea,
-  destinationLat: rideRequest.destinationLat,
-  destinationLng: rideRequest.destinationLng,
-  departureFrom: rideRequest.departureFrom,
-  departureTo: rideRequest.departureTo,
-  seatsRequested: rideRequest.seatsRequested,
-  estimatedFarePaisa: rideRequest.estimatedFarePaisa,
-  finalFarePaisa: rideRequest.finalFarePaisa,
-  status: rideRequest.status,
-  createdAt: rideRequest.createdAt,
-});
+const RIDE_REQUEST_INCLUDE = {
+  poolMemberships: {
+    include: {
+      pool: {
+        include: { driver: { include: { user: { select: { id: true, name: true } } } } },
+      },
+    },
+    take: 1,
+  },
+};
+
+/**
+ * `RideRequestDecline` is unique on `(rideRequestId, driverId)`, so this is the
+ * duplicate-decline code.
+ */
+const isUniqueViolation = (error) =>
+  error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 
 /**
  * Creates a ride request for an authenticated passenger.
@@ -107,6 +114,7 @@ export const listRideRequests = async (passengerId) => {
   const rideRequests = await prisma.rideRequest.findMany({
     where: { passengerId },
     orderBy: { createdAt: 'desc' },
+    include: RIDE_REQUEST_INCLUDE,
   });
 
   return rideRequests.map(toRideRequest);
@@ -130,6 +138,7 @@ export const getRideRequestById = async (passengerId, id) => {
       id,
       passengerId,
     },
+    include: RIDE_REQUEST_INCLUDE,
   });
 
   if (!rideRequest) {
@@ -186,4 +195,187 @@ export const cancelRideRequest = async (passengerId, id) => {
   }
 
   throw AppError.conflict('Ride request cannot be cancelled in its current status');
+};
+
+/**
+ * The queue of ride requests a driver may accept: everything still `WAITING`
+ * that this driver has not already declined.
+ *
+ * This is the driver's counterpart to the passenger's own list, and it exists
+ * because the MVP requires drivers to be able to *see* the requests they are
+ * meant to accept or decline. Without it the only way into the matching step is
+ * to already know a request id, which no client could obtain.
+ *
+ * Scoped by the authenticated driver rather than by anything in the request: the
+ * `driverId` used in the `declines: { none: ... }` filter is the `DriverProfile`
+ * resolved from the access token, so a client cannot widen the queue by naming
+ * somebody else. Onboarding is a prerequisite for the same reason it is in
+ * `pool.service.js`: without a `DriverProfile` there is no `driverId` to filter
+ * declines by, and an onboarded driver with nothing to do is a normal outcome
+ * that returns an empty array rather than a 404.
+ *
+ * `status: 'WAITING'` is the whole of the availability rule. A request leaves
+ * this queue the moment it is accepted - `addPoolMember` claims it with a
+ * conditional `UPDATE ... WHERE status = 'WAITING'` - so the filter needs no
+ * extra "not already in a pool" test, and a request being matched by another
+ * driver at this exact moment is handled by that claim rather than here.
+ *
+ * The driver's own `DriverStatus` (`ONLINE`/`OFFLINE`) is deliberately *not* a
+ * filter. Nothing in the MVP requires an offline driver to be shown an empty
+ * queue, and making availability gate visibility would be a rule nobody specified.
+ * The status remains settable and readable on its own endpoint.
+ *
+ * Ordering is oldest first, which is the matching-queue order the
+ * `(status, createdAt)` index on `ride_requests` exists to serve, and it is the
+ * same order a passenger's requests were created in, so the earliest request is
+ * the one a driver sees first.
+ *
+ * The passenger is projected to `{ id, name }`: a driver deciding whether to
+ * share a car needs to know who they would be collecting, and `email`, `role` and
+ * `passwordHash` are never selected, so they cannot reach the response.
+ */
+export const listAvailableRideRequests = async (userId) => {
+  const driverProfile = await prisma.driverProfile.findUnique({ where: { userId } });
+
+  if (!driverProfile) {
+    throw AppError.notFound('Driver profile not found');
+  }
+
+  const rideRequests = await prisma.rideRequest.findMany({
+    where: {
+      status: 'WAITING',
+      declines: { none: { driverId: driverProfile.id } },
+    },
+    orderBy: { createdAt: 'asc' },
+    select: {
+      id: true,
+      pickupArea: true,
+      pickupLat: true,
+      pickupLng: true,
+      destinationArea: true,
+      destinationLat: true,
+      destinationLng: true,
+      departureFrom: true,
+      departureTo: true,
+      seatsRequested: true,
+      estimatedFarePaisa: true,
+      status: true,
+      createdAt: true,
+      passenger: { select: { id: true, name: true } },
+    },
+  });
+
+  return rideRequests.map((rideRequest) => ({
+    ...toRideRequest(rideRequest),
+    passenger: rideRequest.passenger,
+  }));
+};
+
+/** Fields safe to return for a decline. No relations are selected at all. */
+const toRideRequestDecline = (decline) => ({
+  id: decline.id,
+  rideRequestId: decline.rideRequestId,
+  driverId: decline.driverId,
+  createdAt: decline.createdAt,
+});
+
+/**
+ * One driver declines one ride request.
+ *
+ * This is the half of "accept or decline" that the MVP spells out and that the
+ * schema could not express as a status. A decline is recorded against the *pair*
+ * of driver and request in `RideRequestDecline`, and the passenger's request is
+ * never touched: it stays `WAITING`, keeps its fare and its window, and stays
+ * acceptable by any other driver. There is deliberately no write to
+ * `ride_requests` here at all - `status` is not read to be changed and no
+ * `CANCELLED` is written - because cancelling on a decline would destroy the
+ * passenger's ride over one driver's decision.
+ *
+ * `driverId` is the `DriverProfile` resolved from the verified access token, never
+ * from the body, so a driver can only decline as themselves. Both foreign keys are
+ * therefore server-derived or already-verified paths: the `rideRequestId` is a
+ * path parameter the client is allowed to name, and everything else comes from the
+ * token.
+ *
+ * The guards run cheapest-first, each before the ones after it can leak anything:
+ *
+ * 1. The driver must be onboarded, which is what produces the `driverId` the row
+ *    needs. Un-onboarded drivers get the same 404 as elsewhere in the driver API.
+ * 2. The request must exist.
+ * 3. The request must still be `WAITING`. A request that has been accepted,
+ *    completed or cancelled is no longer a driver decision, and declining it would
+ *    record a fact about a ride that is already decided.
+ *
+ * Only a `WAITING` request can be declined, and every `WAITING` request is
+ * something the driver was allowed to see in the first place, so there is no
+ * separate "may this driver see this request" test to get wrong here.
+ *
+ * Duplication is handled by the database rather than by a read-then-write check:
+ * `(rideRequestId, driverId)` is unique, so a second decline from the same driver
+ * - whether a retry or a genuine race - hits `P2002` and becomes a 409. The raw
+ * Prisma error is swallowed because `P2002` on its own is not something a client
+ * can act on. Declining the same request from two *different* drivers is not a
+ * duplicate at all: both rows are written and the request stays available to
+ * everybody else, which is the behaviour the model exists to provide.
+ */
+export const declineRideRequest = async (userId, id) => {
+  const driverProfile = await prisma.driverProfile.findUnique({ where: { userId } });
+
+  if (!driverProfile) {
+    throw AppError.notFound('Driver profile not found');
+  }
+
+  const rideRequest = await prisma.rideRequest.findUnique({
+    where: { id },
+    select: { id: true, status: true },
+  });
+
+  if (!rideRequest) {
+    throw AppError.notFound('Ride request not found');
+  }
+
+  if (rideRequest.status !== 'WAITING') {
+    throw AppError.conflict('Ride request cannot be declined in its current status');
+  }
+
+  try {
+    const decline = await prisma.$transaction(async (tx) => {
+      /**
+       * The status is re-read under a row lock rather than trusted from the read
+       * above, because the accept path claims this same row with a conditional
+       * `UPDATE` - which takes an exclusive lock on it. Taking the lock here
+       * means a decline cannot land in the gap between that path's status check
+       * and its write: the lock is granted only once the accepting transaction
+       * has committed or rolled back, so the status read underneath it is the
+       * committed one. Either the decline records against a still-waiting
+       * request, or it is refused - never a decline against a taken ride.
+       */
+      const [current] = await tx.$queryRaw`
+        SELECT id, status FROM ride_requests WHERE id = ${id} FOR UPDATE
+      `;
+
+      if (!current) {
+        throw AppError.notFound('Ride request not found');
+      }
+
+      if (current.status !== 'WAITING') {
+        throw AppError.conflict('Ride request cannot be declined in its current status');
+      }
+
+      return tx.rideRequestDecline.create({
+        data: {
+          rideRequestId: id,
+          driverId: driverProfile.id,
+        },
+      });
+    });
+
+    return toRideRequestDecline(decline);
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      throw AppError.conflict('Ride request already declined by this driver');
+    }
+
+    throw error;
+  }
 };

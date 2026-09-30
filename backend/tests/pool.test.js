@@ -57,29 +57,47 @@ const onboardedDriver = async (overrides = {}, payload = vehicle) => {
   };
 };
 
-const createPool = (token, payload) => {
-  const req = request(app).post('/api/pools').set('Authorization', `Bearer ${token}`);
-
-  // Omitting `.send()` leaves the request with no body and no Content-Type,
-  // which is the normal way this endpoint is called.
-  return payload === undefined ? req : req.send(payload);
-};
-
-const listPools = (token) => request(app).get('/api/pools').set('Authorization', `Bearer ${token}`);
-
 /**
  * A departure window the API accepts. Derived from the clock rather than
  * hard-coded, because `departureFrom` must not be in the past and a literal
- * would start failing the day it went by.
+ * would start failing the day it went by. `hours` sets the length, which the
+ * time-window tests vary to put two windows on either side of each other.
  */
-const futureWindow = (hoursFromNow = 24) => {
+const futureWindow = (hoursFromNow = 24, hours = 1) => {
   const departureFrom = new Date(Date.now() + hoursFromNow * 3_600_000);
 
   return {
     departureFrom: departureFrom.toISOString(),
-    departureTo: new Date(departureFrom.getTime() + 3_600_000).toISOString(),
+    departureTo: new Date(departureFrom.getTime() + hours * 3_600_000).toISOString(),
   };
 };
+
+/**
+ * The window `createPool` sends when a test does not name one.
+ *
+ * It is deliberately two hours wide starting at the same hour as
+ * `rideRequestPayload`, so the default pool and the default request always
+ * overlap. A default that did not would make every unrelated test in this file
+ * fail with a time-window conflict, and the tests that care about compatibility
+ * pass an explicit window instead.
+ */
+const poolWindow = () => futureWindow(24, 2);
+
+/**
+ * Opens a pool. The departure window is filled in by default so the tests that
+ * are not about windows do not have to say one; a test that cares passes its own
+ * `payload`, which is merged over the default.
+ */
+const createPool = (token, payload) =>
+  request(app)
+    .post('/api/pools')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ ...poolWindow(), ...payload });
+
+const listPools = (token) => request(app).get('/api/pools').set('Authorization', `Bearer ${token}`);
+
+const getPool = (token, poolId) =>
+  request(app).get(`/api/pools/${poolId}`).set('Authorization', `Bearer ${token}`);
 
 const rideRequestPayload = {
   pickupArea: 'Dhanmondi',
@@ -181,14 +199,35 @@ describe('POST /api/pools', () => {
     });
   });
 
-  it('accepts a request with no body at all', async () => {
+  it('requires a departure window and rejects a bodyless request', async () => {
+    // The window used to be optional because nothing compared it. Now that
+    // `addPoolMember` refuses a request whose window does not overlap the pool's,
+    // a pool with no window could not be matched against anything, so the field
+    // is required and a bodyless request is a 400 rather than a 201.
     const response = await request(app)
       .post('/api/pools')
       .set('Authorization', `Bearer ${token}`)
       .send();
 
-    expect(response.status).toBe(201);
-    expect(response.body.data.pool).toMatchObject({ status: 'OPEN' });
+    expect(response.status).toBe(400);
+    // A bodyless request never reaches the field level: `validateBody` reports a
+    // failure with no path as `body`, which is the honest description - there
+    // was no body to point at a field in. A partial body is covered below.
+    expect(response.body.details).toEqual([
+      { field: 'body', message: expect.any(String) },
+    ]);
+  });
+
+  it('names the missing half when only one end of the window is sent', async () => {
+    const response = await request(app)
+      .post('/api/pools')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ departureFrom: futureWindow().departureFrom });
+
+    expect(response.status).toBe(400);
+    expect(response.body.details).toEqual([
+      { field: 'departureTo', message: expect.any(String) },
+    ]);
   });
 
   it('persists the pool with the derived driver and vehicle', async () => {
@@ -200,12 +239,36 @@ describe('POST /api/pools', () => {
     expect(stored.vehicleId).toBe(teslaId);
   });
 
+  it('stores the departure window as the UTC instant the client sent', async () => {
+    // `+06:00` and `Z` are the same moment written two ways. Whichever the client
+    // chooses, the stored value must be the instant itself, not the local time it
+    // was typed in - this is what lets `addPoolMember` compare the two windows.
+    const offsetWindow = {
+      departureFrom: new Date(Date.now() + 48 * 3_600_000).toISOString(),
+      departureTo: new Date(Date.now() + 49 * 3_600_000).toISOString(),
+    };
+
+    const { pool } = (await createPool(token, offsetWindow)).body.data;
+    const stored = await prisma.pool.findUnique({ where: { id: pool.id } });
+
+    expect(stored.departureFrom.toISOString()).toBe(offsetWindow.departureFrom);
+    expect(stored.departureTo.toISOString()).toBe(offsetWindow.departureTo);
+    expect(pool.departureFrom).toBe(offsetWindow.departureFrom);
+  });
+
   it('creates the pool as OPEN with no start or completion time', async () => {
     const { pool } = (await createPool(token)).body.data;
 
     expect(pool.status).toBe('OPEN');
     expect(pool.startedAt).toBeNull();
     expect(pool.completedAt).toBeNull();
+  });
+
+  it('reports no booked seats and the whole Tesla as available on a new pool', async () => {
+    const { pool } = (await createPool(token)).body.data;
+
+    expect(pool.seatsBooked).toBe(0);
+    expect(pool.seatsAvailable).toBe(vehicle.seatCapacity);
   });
 
   it('returns DTO fields that match the persisted row', async () => {
@@ -217,6 +280,8 @@ describe('POST /api/pools', () => {
       driverId: stored.driverId,
       vehicleId: stored.vehicleId,
       status: stored.status,
+      departureFrom: stored.departureFrom.toISOString(),
+      departureTo: stored.departureTo.toISOString(),
     });
   });
 
@@ -224,16 +289,41 @@ describe('POST /api/pools', () => {
     const { pool } = (await createPool(token)).body.data;
 
     expect(Object.keys(pool).sort()).toEqual(
-      ['id', 'driverId', 'vehicleId', 'status', 'startedAt', 'completedAt', 'createdAt', 'updatedAt'].sort(),
+      [
+        'id',
+        'driverId',
+        'vehicleId',
+        'departureFrom',
+        'departureTo',
+        'status',
+        'seatsBooked',
+        'seatsAvailable',
+        'vehicle',
+        'startedAt',
+        'completedAt',
+        'createdAt',
+        'updatedAt',
+      ].sort(),
     );
   });
 
-  it('never exposes the driver, the vehicle relation or a credential', async () => {
+  it('exposes only the safe vehicle columns, never the driver or a credential', async () => {
     const response = await createPool(token);
     const { pool } = response.body.data;
 
+    // The vehicle summary is new: a driver's own dashboard has to show the plate
+    // and capacity of the car it is offering. It is a hand-picked four columns, so
+    // `driverId` on it - which would point at the DriverProfile - is not there.
+    expect(Object.keys(pool.vehicle).sort()).toEqual(
+      ['id', 'plateNumber', 'model', 'seatCapacity'].sort(),
+    );
+    expect(pool.vehicle).toMatchObject({
+      plateNumber: vehicle.plateNumber,
+      model: vehicle.model,
+      seatCapacity: vehicle.seatCapacity,
+    });
+
     expect(pool).not.toHaveProperty('driver');
-    expect(pool).not.toHaveProperty('vehicle');
     expect(pool).not.toHaveProperty('members');
     expect(JSON.stringify(response.body)).not.toContain('passwordHash');
     expect(JSON.stringify(response.body)).not.toContain(driver.password);
@@ -286,6 +376,7 @@ describe('POST /api/pools', () => {
     );
 
     const pool = await createPoolForUser(userId, {
+      ...poolWindow(),
       driverId: other.driverProfileId,
       vehicleId: other.teslaId,
       status: 'COMPLETED',
@@ -553,7 +644,7 @@ describe('GET /api/pools', () => {
     expect(response.body.data.pools[0].completedAt).not.toBeNull();
   });
 
-  it('never exposes the driver, the vehicle or the members of a pool', async () => {
+  it('never exposes the driver or the members of a pool in the listing', async () => {
     const { id: poolId } = (await createPool(token)).body.data.pool;
     await matchRideRequests(token, poolId, 1);
 
@@ -574,15 +665,19 @@ describe('GET /api/pools', () => {
     expect(response.status).toBe(200);
     expect(response.body.data.pools).toHaveLength(1);
 
+    // A listing stays a summary. `vehicle` is present because it is four
+    // hand-picked columns of the driver's own car, but `members` is not: the
+    // listing is a count, and the member detail lives behind `GET /api/pools/:id`
+    // so a dashboard with many pools does not pull every passenger of every ride.
     const pool = response.body.data.pools[0];
     expect(pool).not.toHaveProperty('driver');
-    expect(pool).not.toHaveProperty('vehicle');
     expect(pool).not.toHaveProperty('members');
+    expect(pool.seatsBooked).toBe(1);
+    expect(pool.seatsAvailable).toBe(vehicle.seatCapacity - 1);
 
     const serialized = JSON.stringify(response.body);
     expect(serialized).not.toContain('passwordHash');
     expect(serialized).not.toContain(driver.password);
-    expect(serialized).not.toContain(vehicle.plateNumber);
   });
 
   it('returns 404 for a driver who has not onboarded', async () => {
@@ -1199,17 +1294,34 @@ describe('PATCH /api/pools/:poolId/start', () => {
     const { pool } = (await startPool(token, poolId)).body.data;
 
     expect(Object.keys(pool).sort()).toEqual(
-      ['id', 'driverId', 'vehicleId', 'status', 'startedAt', 'completedAt', 'createdAt', 'updatedAt'].sort(),
+      [
+        'id',
+        'driverId',
+        'vehicleId',
+        'departureFrom',
+        'departureTo',
+        'status',
+        'seatsBooked',
+        'seatsAvailable',
+        'vehicle',
+        'startedAt',
+        'completedAt',
+        'createdAt',
+        'updatedAt',
+      ].sort(),
     );
   });
 
-  it('never exposes the driver, the vehicle, the members or a credential', async () => {
+  it('never exposes the driver, the members or a credential', async () => {
     const response = await startPool(token, poolId);
     const { pool } = response.body.data;
 
     expect(pool).not.toHaveProperty('driver');
-    expect(pool).not.toHaveProperty('vehicle');
     expect(pool).not.toHaveProperty('members');
+    // The vehicle summary is a deliberate, hand-picked projection.
+    expect(Object.keys(pool.vehicle).sort()).toEqual(
+      ['id', 'plateNumber', 'model', 'seatCapacity'].sort(),
+    );
     expect(JSON.stringify(response.body)).not.toContain('passwordHash');
     expect(JSON.stringify(response.body)).not.toContain(driver.password);
   });
@@ -1926,19 +2038,36 @@ describe('PATCH /api/pools/:poolId/complete', () => {
     const { pool } = (await completePool(token, poolId)).body.data;
 
     expect(Object.keys(pool).sort()).toEqual(
-      ['id', 'driverId', 'vehicleId', 'status', 'startedAt', 'completedAt', 'createdAt', 'updatedAt'].sort(),
+      [
+        'id',
+        'driverId',
+        'vehicleId',
+        'departureFrom',
+        'departureTo',
+        'status',
+        'seatsBooked',
+        'seatsAvailable',
+        'vehicle',
+        'startedAt',
+        'completedAt',
+        'createdAt',
+        'updatedAt',
+      ].sort(),
     );
   });
 
-  it('never exposes the driver, the vehicle, the members or a credential', async () => {
+  it('never exposes the driver, the members or a credential', async () => {
     await start();
 
     const response = await completePool(token, poolId);
     const { pool } = response.body.data;
 
     expect(pool).not.toHaveProperty('driver');
-    expect(pool).not.toHaveProperty('vehicle');
     expect(pool).not.toHaveProperty('members');
+    // The vehicle summary is a deliberate, hand-picked projection.
+    expect(Object.keys(pool.vehicle).sort()).toEqual(
+      ['id', 'plateNumber', 'model', 'seatCapacity'].sort(),
+    );
     expect(JSON.stringify(response.body)).not.toContain('passwordHash');
     expect(JSON.stringify(response.body)).not.toContain(driver.password);
   });

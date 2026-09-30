@@ -361,3 +361,74 @@ describe('POST /api/driver-profile', () => {
     expect(await prisma.tesla.findFirst({ where: { driverId: winner.id } })).not.toBeNull();
   });
 });
+
+describe('GET /api/driver-profile', () => {
+  const read = (token) => request(app).get('/api/driver-profile').set('Authorization', `Bearer ${token}`);
+
+  it('returns the caller profile with its vehicle', async () => {
+    const { profile, userId, token } = await createProfile();
+
+    const response = await read(token);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.driverProfile).toMatchObject({
+      id: profile.id,
+      userId,
+      status: 'OFFLINE',
+      tesla: { plateNumber: vehicle.plateNumber, seatCapacity: 4 },
+    });
+  });
+
+  it('reports the availability the driver last set', async () => {
+    const { token } = await createProfile();
+
+    await request(app)
+      .post('/api/availability')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ status: 'ONLINE' });
+
+    const response = await read(token);
+
+    expect(response.body.data.driverProfile.status).toBe('ONLINE');
+  });
+
+  it('never exposes the account behind the profile', async () => {
+    const { token } = await createProfile();
+
+    const response = await read(token);
+    const serialized = JSON.stringify(response.body);
+
+    expect(serialized).not.toContain('passwordHash');
+    expect(serialized).not.toContain('email');
+    expect(response.body.data.driverProfile.user).toBeUndefined();
+  });
+
+  it('returns 404 before onboarding', async () => {
+    const { token } = await authenticate();
+
+    const response = await read(token);
+
+    expect(response.status).toBe(404);
+    expect(response.body.message).toBe('Driver profile not found');
+  });
+
+  it('returns 403 for a passenger', async () => {
+    const { body } = await request(app).post('/api/auth/register').send({
+      name: 'Nusrat Jahan',
+      email: 'nusrat@example.com',
+      password: 'password123',
+      role: 'PASSENGER',
+    });
+
+    const response = await read(body.data.token);
+
+    expect(response.status).toBe(403);
+  });
+
+  it('returns 401 without a token and for a garbage token', async () => {
+    expect((await request(app).get('/api/driver-profile')).status).toBe(401);
+    expect(
+      (await request(app).get('/api/driver-profile').set('Authorization', 'Bearer nope')).status,
+    ).toBe(401);
+  });
+});

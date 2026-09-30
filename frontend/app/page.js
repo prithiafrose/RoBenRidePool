@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 import { ApiStatusCard } from "../components/api-status-card";
 import { SessionCard } from "../components/session-card";
 
@@ -11,10 +13,10 @@ const STACK = [
 ];
 
 const PLANNED = [
-  "Ride request, matching and tracking endpoints",
-  "Role-aware passenger and driver dashboards",
   "Password reset and email verification",
-  "Broader test coverage and CI pipeline",
+  "Driver earnings and payout history",
+  "In-app messaging between riders and drivers",
+  "Broader frontend test coverage and CI pipeline",
 ];
 
 export default function Home() {
@@ -29,9 +31,24 @@ export default function Home() {
         </h1>
         <p className="max-w-2xl text-lg text-slate-600">
           Shared urban mobility: passengers join a ride instead of paying for a
-          whole car alone, and drivers earn more by filling empty seats. This
-          page is the project placeholder while the MVP is being built.
+          whole car alone, and drivers earn more by filling empty seats. Sign in
+          to request a ride, or to open one and fill your seats.
         </p>
+
+        <div className="flex flex-wrap gap-3">
+          <Link
+            href="/dashboard"
+            className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-700"
+          >
+            Go to dashboard
+          </Link>
+          <Link
+            href="/register"
+            className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-400"
+          >
+            Create an account
+          </Link>
+        </div>
       </header>
 
       <div className="grid gap-6 md:grid-cols-2">

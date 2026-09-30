@@ -1,24 +1,99 @@
 import { Prisma } from '@prisma/client';
 
 import { prisma } from '../config/prisma.js';
+import { toRideRequest } from './rideRequest.mapper.js';
 import { AppError } from '../utils/AppError.js';
 
 /**
- * Fields safe to return. The `driver` and `vehicle` relations are deliberately
- * not selected, which keeps the whole `User` row — and with it `passwordHash` —
- * out of the response without having to enumerate what must be hidden. Nothing
- * on `Pool` itself is sensitive, so every scalar is safe to expose.
+ * `vehicle` and `members` are selected on every pool read, including the one in
+ * `createPool`, so `toPool` can always produce the same shape. Declining to
+ * include them in some reads would give the client two different pool objects
+ * depending on which endpoint it called.
+ *
+ * Only the columns the response needs are selected. The `driver` relation is
+ * deliberately never taken: it is a `DriverProfile`, and reaching the `User`
+ * through it is how `passwordHash` would end up in a payload. A driver who needs
+ * to see who they are dealing with sees it through `members`, which exposes a
+ * passenger's `id` and `name` and nothing else.
  */
-const toPool = (pool) => ({
-  id: pool.id,
-  driverId: pool.driverId,
-  vehicleId: pool.vehicleId,
-  status: pool.status,
-  startedAt: pool.startedAt,
-  completedAt: pool.completedAt,
-  createdAt: pool.createdAt,
-  updatedAt: pool.updatedAt,
-});
+const POOL_INCLUDE = {
+  vehicle: {
+    select: { id: true, plateNumber: true, model: true, seatCapacity: true },
+  },
+  members: {
+    select: {
+      id: true,
+      poolId: true,
+      rideRequestId: true,
+      seats: true,
+      farePaisa: true,
+      createdAt: true,
+      updatedAt: true,
+    },
+  },
+};
+
+/**
+ * Fields safe to return for a pool, in every endpoint that returns one.
+ *
+ * The departure window is part of the public shape because it is the thing a
+ * passenger is being offered: a dashboard has to show who is leaving when, and a
+ * driver has to see their own committed window next to the requests they accept
+ * into it.
+ *
+ * `seatsBooked`/`seatsAvailable` are derived here rather than stored, so they can
+ * never drift from the `PoolMember` rows that are the source of truth. Capacity
+ * counts the driver's own seat, because `Tesla.seatCapacity` includes it, which is
+ * why no `- 1` appears here - the same convention the capacity guard in
+ * `addPoolMember` uses.
+ */
+const toPool = (pool) => {
+  const seatsBooked = pool.members.reduce((total, member) => total + member.seats, 0);
+
+  return {
+    id: pool.id,
+    driverId: pool.driverId,
+    vehicleId: pool.vehicleId,
+    departureFrom: pool.departureFrom,
+    departureTo: pool.departureTo,
+    status: pool.status,
+    seatsBooked,
+    seatsAvailable: Math.max(0, pool.vehicle.seatCapacity - seatsBooked),
+    vehicle: {
+      id: pool.vehicle.id,
+      plateNumber: pool.vehicle.plateNumber,
+      model: pool.vehicle.model,
+      seatCapacity: pool.vehicle.seatCapacity,
+    },
+    startedAt: pool.startedAt,
+    completedAt: pool.completedAt,
+    createdAt: pool.createdAt,
+    updatedAt: pool.updatedAt,
+  };
+};
+
+/**
+ * The compatibility rule between a pool's departure window and a ride request's.
+ *
+ * Both windows are half-open, `[from, to)`, so two windows overlap when
+ *
+ *     a.from < b.to  AND  b.from < a.to
+ *
+ * Both halves are strict, which is what makes the boundary case come out the way
+ * the domain wants: a passenger whose window closes at exactly the moment the
+ * driver departs is *not* compatible. They share one instant, but there is no
+ * time in which the passenger could actually be picked up, and treating that
+ * instant as a match would put a rider in a car that has already gone. Widening
+ * either half to `<=` would accept that request and is deliberately not done.
+ *
+ * A contained window overlaps a containing one, and two identical windows overlap
+ * each other; both fall out of the same two comparisons without special cases.
+ *
+ * The instants are `Date` values holding UTC, so this is a plain numeric
+ * comparison and two windows written in different offsets - `08:00+06:00` and
+ * `02:00Z` - compare as the equal moments they are.
+ */
+const windowsOverlap = (aFrom, aTo, bFrom, bTo) => aFrom < bTo && bFrom < aTo;
 
 /**
  * Opens a new pool for the authenticated driver.
@@ -36,9 +111,13 @@ const toPool = (pool) => ({
  * `status` is left to the Prisma default of `OPEN`, and the timestamps are
  * left to the database, so a pool is never born started or completed.
  *
- * The request body is not an input to this function. That is the real reason a
- * client cannot forge a `driverId` or a `vehicleId`: the value never travels
- * from the HTTP layer into the insert.
+ * The departure window is the one value that does come from the body, because a
+ * driver is the only party who knows when they intend to leave. It arrives as the
+ * validated ISO 8601 strings and is converted to `Date` here, for the same reason
+ * as in `rideRequest.service.js`: the validator decides whether the value is well
+ * formed, the service is where a `Date` belongs. The conversions are written after
+ * nothing to spread over, so there is no client-controlled key that could reach
+ * the insert under the same name.
  *
  * Onboarding is a prerequisite rather than something to work around: a driver
  * without a `DriverProfile`, or with a profile whose Tesla is missing, cannot
@@ -46,7 +125,7 @@ const toPool = (pool) => ({
  * the missing record here instead would let a client onboard itself as a side
  * effect of opening a pool.
  */
-export const createPool = async (userId) => {
+export const createPool = async (userId, { departureFrom, departureTo }) => {
   const driverProfile = await prisma.driverProfile.findUnique({ where: { userId } });
 
   if (!driverProfile) {
@@ -60,7 +139,13 @@ export const createPool = async (userId) => {
   }
 
   const pool = await prisma.pool.create({
-    data: { driverId: driverProfile.id, vehicleId: tesla.id },
+    data: {
+      driverId: driverProfile.id,
+      vehicleId: tesla.id,
+      departureFrom: new Date(departureFrom),
+      departureTo: new Date(departureTo),
+    },
+    include: POOL_INCLUDE,
   });
 
   return toPool(pool);
@@ -96,9 +181,65 @@ export const listPools = async (userId) => {
   const pools = await prisma.pool.findMany({
     where: { driverId: driverProfile.id },
     orderBy: { createdAt: 'desc' },
+    include: POOL_INCLUDE,
   });
 
   return pools.map(toPool);
+};
+
+/**
+ * One pool in full, for the driver's own dashboard: the pool itself, the vehicle
+ * it runs on, and every member with the ride request and passenger behind it.
+ *
+ * This is the read that lets a driver follow a ride they are serving. Without it
+ * a driver can create and transition pools but has no way to see who is in one,
+ * what their window is, or how each of their passengers' requests has progressed
+ * - which the MVP requires of both sides.
+ *
+ * Ownership is answered with the same 404 as a missing pool, on purpose. A 403
+ * would confirm that the pool id exists, which hands one driver an oracle for
+ * discovering other drivers' pool ids. This is the same reasoning that governs
+ * `addPoolMember`, `getRideRequestById` and the `getPool` call below itself.
+ *
+ * The passenger projection is `{ id, name }` and nothing more, selected rather
+ * than filtered after the fact: `email`, `passwordHash` and `role` are never
+ * fetched, so they cannot reach the response even if this DTO were wrong about
+ * what to keep.
+ */
+export const getPool = async (userId, poolId) => {
+  const driverProfile = await prisma.driverProfile.findUnique({ where: { userId } });
+
+  if (!driverProfile) {
+    throw AppError.notFound('Driver profile not found');
+  }
+
+  const pool = await prisma.pool.findUnique({
+    where: { id: poolId },
+    include: {
+      vehicle: POOL_INCLUDE.vehicle,
+      members: {
+        include: {
+          rideRequest: {
+            include: { passenger: { select: { id: true, name: true } } },
+          },
+        },
+        orderBy: { createdAt: 'asc' },
+      },
+    },
+  });
+
+  if (!pool) {
+    throw AppError.notFound('Pool not found');
+  }
+
+  if (pool.driverId !== driverProfile.id) {
+    throw AppError.notFound('Pool not found');
+  }
+
+  return {
+    ...toPool(pool),
+    members: pool.members.map(toPoolMemberDetail),
+  };
 };
 
 /** Fields safe to return for a membership. No relations are selected at all. */
@@ -112,6 +253,27 @@ const toPoolMember = (poolMember) => ({
   updatedAt: poolMember.updatedAt,
 });
 
+/**
+ * A membership as the owning driver sees it: the allocation, the ride request
+ * behind it and the passenger who wants it.
+ *
+ * This is the projection that makes a pool detail page possible without any
+ * further endpoint. It reuses `toPoolMember` for the allocation itself and adds
+ * the ride request through `toRideRequest`, so a driver's view of a member's
+ * request and the passenger's own view of it are produced by the same mapper and
+ * cannot drift apart on a field like `status` or the final fare.
+ */
+const toPoolMemberDetail = (poolMember) => ({
+  ...toPoolMember(poolMember),
+  rideRequest: {
+    ...toRideRequest(poolMember.rideRequest),
+    passenger: {
+      id: poolMember.rideRequest.passenger.id,
+      name: poolMember.rideRequest.passenger.name,
+    },
+  },
+});
+
 /** `PoolMember.rideRequestId` is unique, so this is the duplicate-membership code. */
 const isUniqueViolation = (error) =>
   error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
@@ -119,22 +281,26 @@ const isUniqueViolation = (error) =>
 /**
  * Adds a waiting ride request to one of the authenticated driver's own pools.
  *
- * This is the matching step: a passenger's `WAITING` RideRequest becomes a
- * `PoolMember` of an `OPEN` pool, and the request moves to `MATCHED`.
+ * This is both the matching step and the driver's "accept" action: a passenger's
+ * `WAITING` RideRequest becomes a `PoolMember` of an `OPEN` pool, and the request
+ * moves to `MATCHED`. It is deliberately the same endpoint rather than a second
+ * one beside it - the domain has no separate offer to accept, so there is nothing
+ * for a distinct "accept" call to do that this does not already do atomically.
  *
  * Only three values reach this function: the authenticated `userId` and the two
- * ids the client is allowed to name. The request body is not an input, which is
- * the real reason a client cannot forge `seats` or `farePaisa` - those are read
- * off the RideRequest here and never travel from the HTTP layer into the insert.
+ * ids the client is allowed to name. `seats` and `farePaisa` are read off the
+ * RideRequest here and never travel from the HTTP layer into the insert, which is
+ * the real reason a client cannot forge either one.
  *
- * The guards run cheapest-first, and each one is checked before the ones after
- * it can leak anything:
+ * The guards run cheapest-first, and each one is checked before the ones after it
+ * can leak anything:
  *
  * 1. The driver must be onboarded, so `driverId` is resolved from the verified
  *    token rather than the body.
  * 2. The pool must exist, belong to that driver, and be `OPEN`.
  * 3. The ride request must exist and be `WAITING`.
- * 4. The Tesla must have room.
+ * 4. The two departure windows must overlap (see `windowsOverlap`).
+ * 5. The Tesla must have room.
  *
  * Ownership is answered with the same 404 as a missing pool on purpose. A 403
  * would confirm that the id exists, which hands one driver an oracle for
@@ -144,6 +310,13 @@ const isUniqueViolation = (error) =>
  * Seat capacity counts the driver's own seat, because `Tesla.seatCapacity`
  * includes it, so the sum of the member allocations is compared against the
  * raw capacity with no `- 1` adjustment.
+ *
+ * Neither window can change while this function runs: nothing in the API edits a
+ * `Pool` or `RideRequest` departure window after it is created. That is why the
+ * overlap test is not repeated inside the transaction - it would read the same two
+ * values and could not reach a different answer. The status claim and the capacity
+ * re-check below *are* repeated there, because both depend on rows that other
+ * requests change concurrently.
  */
 export const addPoolMember = async (userId, poolId, rideRequestId) => {
   const driverProfile = await prisma.driverProfile.findUnique({ where: { userId } });
@@ -152,8 +325,9 @@ export const addPoolMember = async (userId, poolId, rideRequestId) => {
     throw AppError.notFound('Driver profile not found');
   }
 
-  // The Tesla capacity and the seats already committed are needed for the
-  // capacity check, so they are selected up front rather than in a second query.
+  // The Tesla capacity, the seats already committed and the pool's own departure
+  // window are all needed for the checks below, so they are selected up front
+  // rather than in a second query.
   const pool = await prisma.pool.findUnique({
     where: { id: poolId },
     include: {
@@ -182,6 +356,29 @@ export const addPoolMember = async (userId, poolId, rideRequestId) => {
 
   if (rideRequest.status !== 'WAITING') {
     throw AppError.conflict('Ride request cannot be added to this pool in its current status');
+  }
+
+  /**
+   * The time-window rule, and the reason the passenger's `departureFrom` means
+   * anything. A request whose window does not overlap this pool's cannot be
+   * served by this ride, so it is refused with a 409 rather than accepted into a
+   * car that leaves at a time the passenger cannot use.
+   *
+   * This is checked before capacity on purpose: it is two numbers already in
+   * memory, and it is the more specific failure - "your window does not fit this
+   * ride" is more useful to a driver than "there is no room" when both are true.
+   */
+  if (
+    !windowsOverlap(
+      pool.departureFrom,
+      pool.departureTo,
+      rideRequest.departureFrom,
+      rideRequest.departureTo,
+    )
+  ) {
+    throw AppError.conflict(
+      'Pool departure window does not overlap the ride request departure window',
+    );
   }
 
   const seatsAlreadyBooked = pool.members.reduce((total, member) => total + member.seats, 0);
@@ -444,8 +641,11 @@ export const startPool = async (userId, poolId) => {
     });
 
     // Re-read through the transaction client so the response reflects the row
-    // this transaction just wrote, rather than the pre-flight read above.
-    return tx.pool.findUnique({ where: { id: pool.id } });
+    // this transaction just wrote, rather than the pre-flight read above. The
+    // `POOL_INCLUDE` is required, not decorative: `toPool` derives `seatsBooked`
+    // and `seatsAvailable` from the members and reads the vehicle, so a bare
+    // `findUnique` would leave it with nothing to sum.
+    return tx.pool.findUnique({ where: { id: pool.id }, include: POOL_INCLUDE });
   });
 
   return toPool(started);
@@ -518,7 +718,7 @@ export const completePool = async (userId, poolId) => {
       }
     }
 
-    return tx.pool.findUnique({ where: { id: pool.id } });
+    return tx.pool.findUnique({ where: { id: pool.id }, include: POOL_INCLUDE });
   });
 
   return toPool(completed);

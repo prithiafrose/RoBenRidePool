@@ -1,11 +1,23 @@
-import { addPoolMember, completePool, createPool, listPools, startPool } from '../services/pool.service.js';
+import {
+  addPoolMember,
+  completePool,
+  createPool,
+  getPool,
+  listPools,
+  startPool,
+} from '../services/pool.service.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 
 /** POST /api/pools (protected by `authenticate` and `requireRole`) */
 export const create = async (req, res) => {
-  // `req.body` is not forwarded: the pool's driver and vehicle are resolved
-  // from the authenticated identity alone.
-  const pool = await createPool(req.user.id);
+  // Only the departure window is forwarded, field by field. `driverId`,
+  // `vehicleId` and `status` are never passed on, so a client that sends them
+  // has nothing for the service to be misled with - and even if it did, the
+  // service resolves them from the authenticated identity regardless.
+  const pool = await createPool(req.user.id, {
+    departureFrom: req.body.departureFrom,
+    departureTo: req.body.departureTo,
+  });
 
   return sendSuccess(res, { pool }, 201, 'Pool created successfully');
 };
@@ -17,6 +29,17 @@ export const list = async (req, res) => {
   const pools = await listPools(req.user.id);
 
   return sendSuccess(res, { pools }, 200, 'Pools retrieved successfully');
+};
+
+/** GET /api/pools/:poolId (protected by `authenticate` and `requireRole`) */
+export const getById = async (req, res) => {
+  // `req.user.id` and the path parameter are the only inputs. `req.body` is not
+  // forwarded, so the pool that comes back is the one this driver owns or none
+  // at all; the service answers a foreign pool with the same 404 as a missing
+  // one.
+  const pool = await getPool(req.user.id, req.params.poolId);
+
+  return sendSuccess(res, { pool }, 200, 'Pool retrieved successfully');
 };
 
 /** POST /api/pools/:poolId/members (protected by `authenticate` and `requireRole`) */

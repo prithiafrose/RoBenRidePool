@@ -108,6 +108,8 @@ model DriverProfile {
   tesla Tesla?
   /// Pools this driver is offering.
   pools Pool[]
+  /// Ride requests this driver has declined.
+  declines RideRequestDecline[]
 
   @@index([status])
   @@map("driver_profiles")
@@ -185,6 +187,10 @@ model RideRequest {
   /// The membership rows this request takes part in. A request is expected to
   /// be in at most one active pool; see PoolMember for the enforced part.
   poolMemberships PoolMember[]
+  /// The drivers who have passed on this request. Kept as rows rather than
+  /// folded into `status`: a decline is a fact about one driver, while `status`
+  /// is the state of the request itself.
+  declines RideRequestDecline[]
 
   // Matching queue: oldest WAITING requests first, per passenger history.
   @@index([status, createdAt])
@@ -210,6 +216,22 @@ model Pool {
   /// cannot express that cross-table rule, so the service layer verifies it.
   vehicleId String
   vehicle   Tesla  @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+
+  /// The window in which this driver intends to depart, stated when the pool is
+  /// opened. It is half-open - `[departureFrom, departureTo)` - so a ride that
+  /// departs exactly when a passenger's window closes does not match it.
+  ///
+  /// This is what gives `RideRequest.departureFrom`/`departureTo` their meaning
+  /// at matching time: a request is acceptable only when its window overlaps
+  /// this one. Both sides are required, because a pool with an unknown departure
+  /// time cannot be matched against a timed request at all, and defaulting it
+  /// would silently accept every request instead.
+  ///
+  /// Stored as UTC instants on `TIMESTAMP(3)` without time zone, exactly like the
+  /// ride-request pair: the client sends an explicit offset, so nothing here has
+  /// to assume which city the driver is standing in.
+  departureFrom DateTime
+  departureTo   DateTime
 
   status PoolStatus @default(OPEN)
 
@@ -259,6 +281,45 @@ model PoolMember {
   /// Reverse lookup: "which pool is this request in?" is served by the unique
   /// index on rideRequestId, so no separate @@index is declared here.
   @@map("pool_members")
+}
+
+/// One driver's refusal of one ride request.
+///
+/// This row is deliberately *not* a state on `RideRequest`, which is why
+/// `RideRequestStatus` has no `DECLINED` member. Declining is a fact about one
+/// driver looking at one request, while `status` describes the request itself,
+/// and the passenger's request survives a decline untouched: it stays `WAITING`
+/// and remains acceptable by any other driver. Folding a decline into `status`
+/// would have to cancel the request for everybody, which is precisely the
+/// behaviour the domain forbids.
+///
+/// Naming the pair `(rideRequestId, driverId)` unique is what makes the model
+/// safe under concurrency: many drivers may decline one request, one driver may
+/// decline a given request once, and the database - not a read-then-write check -
+/// is what enforces the second half. It also turns a repeated decline into a
+/// clean 409 instead of a duplicate row.
+model RideRequestDecline {
+  id String @id @default(uuid())
+
+  /// The request this driver passed on. Cascaded, so a request removed from the
+  /// system takes its declines with it and leaves no orphans behind.
+  rideRequestId String
+  rideRequest   RideRequest @relation(fields: [rideRequestId], references: [id], onDelete: Cascade)
+
+  /// The driver who declined, keyed by `DriverProfile` rather than by `User`,
+  /// because declining is a driving decision and every other driver-side
+  /// relation in this schema is keyed by profile too. Cascaded with the profile.
+  driverId String
+  driver   DriverProfile @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  /// A driver declines a given request at most once.
+  @@unique([rideRequestId, driverId])
+  /// "Which requests has this driver passed on, and when?" - the driver's own
+  /// history and the filter behind their available-rides queue.
+  @@index([driverId, createdAt])
+  @@map("ride_request_declines")
 }
 
 // ---------------------------------------------------------------------------

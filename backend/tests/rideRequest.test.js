@@ -590,6 +590,7 @@ describe('GET /api/ride-requests/:id', () => {
         'estimatedFarePaisa',
         'finalFarePaisa',
         'status',
+        'pool',
         'createdAt',
       ].sort(),
     );
@@ -713,6 +714,7 @@ describe('PATCH /api/ride-requests/:id/cancel', () => {
         'estimatedFarePaisa',
         'finalFarePaisa',
         'status',
+        'pool',
         'createdAt',
       ].sort(),
     );

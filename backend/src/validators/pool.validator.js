@@ -1,40 +1,57 @@
 import { z } from 'zod';
 
-/**
- * Body of `POST /api/pools`, which is empty by design: everything the row
- * needs is derived server-side from the access token (see `pool.service.js`).
- * `driverId`, `vehicleId`, `status`, the ids and the timestamps are therefore
- * not just "not required" here, they are absent, so nothing the client sends
- * can be mistaken for them.
- *
- * An empty object schema with `.nullish()` is what makes a bodyless request
- * work: this project runs Express 5, where `req.body` stays `undefined` when
- * no body parser matched the request (no `Content-Type` at all), and a bare
- * `z.object({})` would reject that as a missing body. `.nullish()` accepts
- * every shape of "no body" — absent, `{}` and `null` — while still rejecting a
- * body that is not an object at all, such as a bare array.
- *
- * The schema stays non-strict on purpose, matching `auth.validator.js` and
- * `rideRequest.validator.js`: `validateBody` strips unknown keys, so a client
- * that sends `vehicleId` has it discarded rather than echoed. That is a
- * convenience, not the security control — `createPool` never receives
- * `req.body` at all, so a stripped key is also a key the service cannot read.
- */
-const emptyBody = z.object({}).nullish();
-
-export const createPoolSchema = emptyBody;
+import { departureInstant, departureWindow } from './departureWindow.validator.js';
 
 /**
  * Body of the lifecycle endpoints, `PATCH /api/pools/:poolId/start` and
  * `PATCH /api/pools/:poolId/complete`.
  *
- * Empty for the same reason as `createPoolSchema`, and it is the same schema
- * object rather than a second copy: a status transition takes nothing from the
- * client. `status`, `startedAt`, `completedAt`, `finalFarePaisa`, `driverId` and
- * `vehicleId` are all decided server-side, so a client that sends them has them
- * discarded by `validateBody`, and the controller forwards no body at all — so
- * even without this middleware the service would have no value to be misled by.
+ * Empty by design: a status transition takes nothing from the client. `status`,
+ * `startedAt`, `completedAt`, `finalFarePaisa`, `driverId` and `vehicleId` are all
+ * decided server-side, so a client that sends them has them discarded by
+ * `validateBody`, and the controller forwards no body at all - so even without
+ * this middleware the service would have no value to be misled by.
+ *
+ * `.nullish()` is what makes a bodyless request work: this project runs Express 5,
+ * where `req.body` stays `undefined` when no body parser matched the request (no
+ * `Content-Type` at all), and a bare `z.object({})` would reject that as a
+ * missing body. `.nullish()` accepts every shape of "no body" - absent, `{}` and
+ * `null` - while still rejecting a body that is not an object at all, such as a
+ * bare array.
  */
+const emptyBody = z.object({}).nullish();
+
+/**
+ * Body of `POST /api/pools`, which is exactly the departure window the driver is
+ * offering and nothing else.
+ *
+ * The window is the one thing that genuinely has to come from the client: a
+ * driver knows when they intend to leave, and the server cannot invent it. It is
+ * required rather than optional because the whole matching rule hangs off it -
+ * `addPoolMember` accepts a ride request only when its window overlaps this one -
+ * and a pool with no window would have to either accept every request or be
+ * unmatchable. Requiring it keeps that decision explicit instead of defaulting
+ * it silently.
+ *
+ * Both fields are validated by `departureWindow.validator.js`, the same module
+ * the passenger's own window is validated by, so the two sides of a comparison
+ * can never disagree about what a well-formed instant is. That matters in
+ * particular for the explicit-offset rule: a naive timestamp here would put an
+ * uninterpretable instant into the column the overlap check reads.
+ *
+ * `driverId`, `vehicleId`, `status` and the timestamps are still absent by
+ * design: everything the row needs besides the window is derived server-side from
+ * the access token (see `pool.service.js`), so a client that sends them has them
+ * stripped and the server values win. The schema stays non-strict on purpose,
+ * matching `auth.validator.js` and `rideRequest.validator.js`.
+ */
+export const createPoolSchema = z
+  .object({
+    departureFrom: departureInstant('departureFrom'),
+    departureTo: departureInstant('departureTo'),
+  })
+  .superRefine(departureWindow);
+
 export const poolLifecycleSchema = emptyBody;
 
 /**

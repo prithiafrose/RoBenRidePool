@@ -40,6 +40,31 @@ const isUniqueViolation = (error) =>
   error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
 
 /**
+ * The authenticated driver's own profile.
+ *
+ * Reads by `userId`, the one value that comes from the verified access token, so
+ * this can only ever return the caller's own profile - there is no id in the path
+ * for a client to point somewhere else.
+ *
+ * Returns 404 rather than null while the driver has not onboarded. That is the
+ * same answer `setDriverAvailability` gives, and it is what lets the dashboard
+ * treat "no profile yet" as a state to onboard from rather than an empty object
+ * it has to guess the meaning of.
+ */
+export const getDriverProfile = async (userId) => {
+  const driverProfile = await prisma.driverProfile.findUnique({
+    where: { userId },
+    include: { tesla: true },
+  });
+
+  if (!driverProfile) {
+    throw AppError.notFound('Driver profile not found');
+  }
+
+  return toDriverProfile(driverProfile);
+};
+
+/**
  * Onboards a driver: creates the DriverProfile and the single Tesla that the
  * schema allows it, atomically.
  *
