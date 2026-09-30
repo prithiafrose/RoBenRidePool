@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
 
 import { FormAlert, FormField, SubmitButton } from "../../components/auth-form-parts";
 import { useAuthForm } from "../../hooks/use-auth-form";
@@ -15,7 +14,6 @@ export default function LoginPage() {
     email: "",
     password: "",
   });
-  const [successMessage, setSuccessMessage] = useState("");
 
   const onSubmit = async (event) => {
     event.preventDefault();
@@ -25,8 +23,7 @@ export default function LoginPage() {
     if (!data) return;
 
     saveSession(data);
-    setSuccessMessage(`Welcome back, ${data.user.name}. Taking you to the dashboard...`);
-    router.push("/");
+    router.replace("/dashboard");
   };
 
   return (
@@ -66,12 +63,6 @@ export default function LoginPage() {
           />
 
           <FormAlert>{formError}</FormAlert>
-
-          {successMessage ? (
-            <p className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
-              {successMessage}
-            </p>
-          ) : null}
 
           <SubmitButton isLoading={isLoading}>Sign in</SubmitButton>
         </form>

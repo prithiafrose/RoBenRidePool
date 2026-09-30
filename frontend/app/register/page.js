@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
 
 import {
   FormAlert,
@@ -22,7 +21,6 @@ export default function RegisterPage() {
     password: "",
     role: "PASSENGER",
   });
-  const [successMessage, setSuccessMessage] = useState("");
 
   const onSubmit = async (event) => {
     event.preventDefault();
@@ -32,10 +30,7 @@ export default function RegisterPage() {
     if (!data) return;
 
     saveSession(data);
-    setSuccessMessage(
-      `Account created for ${data.user.email}. Taking you to the dashboard...`,
-    );
-    router.push("/");
+    router.replace("/dashboard");
   };
 
   return (
@@ -93,12 +88,6 @@ export default function RegisterPage() {
           />
 
           <FormAlert>{formError}</FormAlert>
-
-          {successMessage ? (
-            <p className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
-              {successMessage}
-            </p>
-          ) : null}
 
           <SubmitButton isLoading={isLoading}>Create account</SubmitButton>
         </form>
