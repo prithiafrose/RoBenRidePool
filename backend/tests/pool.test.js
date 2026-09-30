@@ -7,7 +7,9 @@ import { createApp } from '../src/app.js';
 import { prisma } from '../src/config/prisma.js';
 import {
   addPoolMember as addPoolMemberForUser,
+  completePool as completePoolForUser,
   createPool as createPoolForUser,
+  startPool as startPoolForUser,
 } from '../src/services/pool.service.js';
 
 const app = createApp();
@@ -91,6 +93,51 @@ const addMember = (token, poolId, payload) =>
     .post(`/api/pools/${poolId}/members`)
     .set('Authorization', `Bearer ${token}`)
     .send(payload);
+
+/**
+ * Builds a lifecycle request. Both transitions take an empty body, so omitting
+ * `payload` leaves the request with no body and no Content-Type, which is the
+ * normal way these endpoints are called.
+ */
+const lifecycle = (action) => (token, poolId, payload) => {
+  const req = request(app).patch(`/api/pools/${poolId}/${action}`).set('Authorization', `Bearer ${token}`);
+
+  return payload === undefined ? req : req.send(payload);
+};
+
+const startPool = lifecycle('start');
+const completePool = lifecycle('complete');
+
+/**
+ * Onboards a second driver with their own Tesla and their own OPEN pool, for the
+ * ownership tests. The default plate is already taken by the driver under test.
+ */
+const otherDriverWithPool = async () => {
+  const other = await onboardedDriver(
+    { name: 'Other Driver', email: 'other@example.com' },
+    { ...vehicle, plateNumber: 'DHK-9999' },
+  );
+  const { id: otherPoolId } = (await createPool(other.token)).body.data.pool;
+
+  return { ...other, otherPoolId };
+};
+
+/** Adds `count` distinct waiting ride requests to `token`'s own pool. */
+const matchRideRequests = async (token, poolId, count) => {
+  const members = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const { rideRequest } = await passengerWithRideRequest(
+      { email: `passenger${index}@example.com` },
+      { ...rideRequestPayload, seatsRequested: 1 },
+    );
+
+    const { body } = await addMember(token, poolId, { rideRequestId: rideRequest.id });
+    members.push({ rideRequest, poolMember: body.data.poolMember });
+  }
+
+  return members;
+};
 
 describe('POST /api/pools', () => {
   let token;
@@ -823,5 +870,692 @@ describe('POST /api/pools/:poolId/members', () => {
 
     expect(await prisma.poolMember.count()).toBe(1);
     expect((await prisma.poolMember.findFirst()).poolId).toBe(poolId);
+  });
+});
+
+describe('PATCH /api/pools/:poolId/start', () => {
+  let token;
+  let userId;
+  let poolId;
+
+  beforeEach(async () => {
+    ({ token, userId } = await onboardedDriver());
+    ({ id: poolId } = (await createPool(token)).body.data.pool);
+  });
+
+  it('lets a driver start their own open pool', async () => {
+    const response = await startPool(token, poolId);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      success: true,
+      message: 'Pool started successfully',
+    });
+    expect(response.body.data.pool).toMatchObject({ id: poolId, status: 'IN_PROGRESS' });
+  });
+
+  it('persists the pool as IN_PROGRESS', async () => {
+    const { id } = (await startPool(token, poolId)).body.data.pool;
+
+    const stored = await prisma.pool.findUnique({ where: { id } });
+    expect(stored.status).toBe('IN_PROGRESS');
+  });
+
+  it('stamps startedAt at the moment of the transition', async () => {
+    const before = new Date();
+    const { pool } = (await startPool(token, poolId)).body.data;
+    const after = new Date();
+
+    expect(pool.startedAt).not.toBeNull();
+    const startedAt = new Date(pool.startedAt);
+    expect(startedAt.getTime()).toBeGreaterThanOrEqual(before.getTime());
+    expect(startedAt.getTime()).toBeLessThanOrEqual(after.getTime());
+  });
+
+  it('leaves completedAt null', async () => {
+    const { pool } = (await startPool(token, poolId)).body.data;
+
+    expect(pool.completedAt).toBeNull();
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).completedAt).toBeNull();
+  });
+
+  it('accepts a request with no body at all', async () => {
+    const response = await request(app)
+      .patch(`/api/pools/${poolId}/start`)
+      .set('Authorization', `Bearer ${token}`)
+      .send();
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pool.status).toBe('IN_PROGRESS');
+  });
+
+  it('moves every matched ride request to IN_PROGRESS', async () => {
+    const members = await matchRideRequests(token, poolId, 2);
+
+    const response = await startPool(token, poolId);
+    expect(response.status).toBe(200);
+
+    for (const { rideRequest } of members) {
+      const stored = await prisma.rideRequest.findUnique({ where: { id: rideRequest.id } });
+      expect(stored.status).toBe('IN_PROGRESS');
+    }
+  });
+
+  it('starts a pool with no members', async () => {
+    expect(await prisma.poolMember.count()).toBe(0);
+
+    const response = await startPool(token, poolId);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pool.status).toBe('IN_PROGRESS');
+    expect(response.body.data.pool.startedAt).not.toBeNull();
+  });
+
+  it('leaves a ride request outside the pool untouched', async () => {
+    // A second pool of the same driver's, with its own matched request, must not
+    // be dragged along by this pool's transition.
+    const { id: otherPoolId } = (await createPool(token)).body.data.pool;
+    const [inside] = await matchRideRequests(token, poolId, 1);
+    const { rideRequest: outside } = await passengerWithRideRequest(
+      { email: 'outsider@example.com' },
+      rideRequestPayload,
+    );
+    await addMember(token, otherPoolId, { rideRequestId: outside.id });
+
+    expect((await startPool(token, poolId)).status).toBe(200);
+
+    expect(
+      (await prisma.rideRequest.findUnique({ where: { id: inside.rideRequest.id } })).status,
+    ).toBe('IN_PROGRESS');
+    expect(
+      (await prisma.rideRequest.findUnique({ where: { id: outside.id } })).status,
+    ).toBe('MATCHED');
+  });
+
+  it('returns exactly the documented DTO fields', async () => {
+    const { pool } = (await startPool(token, poolId)).body.data;
+
+    expect(Object.keys(pool).sort()).toEqual(
+      ['id', 'driverId', 'vehicleId', 'status', 'startedAt', 'completedAt', 'createdAt', 'updatedAt'].sort(),
+    );
+  });
+
+  it('never exposes the driver, the vehicle, the members or a credential', async () => {
+    const response = await startPool(token, poolId);
+    const { pool } = response.body.data;
+
+    expect(pool).not.toHaveProperty('driver');
+    expect(pool).not.toHaveProperty('vehicle');
+    expect(pool).not.toHaveProperty('members');
+    expect(JSON.stringify(response.body)).not.toContain('passwordHash');
+    expect(JSON.stringify(response.body)).not.toContain(driver.password);
+  });
+
+  it('rejects a passenger with 403', async () => {
+    const passenger = await authenticate({
+      name: 'Other Passenger',
+      email: 'otherpassenger@example.com',
+      role: 'PASSENGER',
+    });
+
+    const response = await startPool(passenger.token, poolId);
+
+    expect(response.status).toBe(403);
+    expect(response.body.message).toBe('You do not have permission to perform this action');
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('OPEN');
+  });
+
+  it('rejects an unauthenticated request with 401', async () => {
+    const response = await request(app).patch(`/api/pools/${poolId}/start`).send();
+
+    expect(response.status).toBe(401);
+    expect(response.body.success).toBe(false);
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('OPEN');
+  });
+
+  it('rejects a garbage token with 401', async () => {
+    const response = await request(app)
+      .patch(`/api/pools/${poolId}/start`)
+      .set('Authorization', 'Bearer not.a.jwt')
+      .send();
+
+    expect(response.status).toBe(401);
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('OPEN');
+  });
+
+  it('rejects a malformed pool id with a field-level 400', async () => {
+    const response = await startPool(token, 'not-a-uuid');
+
+    expect(response.status).toBe(400);
+    expect(response.body.message).toBe('Validation failed');
+    expect(response.body.details).toEqual([
+      { field: 'poolId', message: 'Pool id must be a valid UUID' },
+    ]);
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('OPEN');
+  });
+
+  it('returns 404 for a driver who has not onboarded', async () => {
+    const fresh = await authenticate({ name: 'No Profile', email: 'noprofile@example.com' });
+
+    const response = await startPool(fresh.token, poolId);
+
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({ success: false, message: 'Driver profile not found' });
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('OPEN');
+  });
+
+  it('returns 404 for a pool that does not exist', async () => {
+    const response = await startPool(token, randomUUID());
+
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({ success: false, message: 'Pool not found' });
+  });
+
+  it("returns the same 404 for another driver's pool", async () => {
+    // A 403 would confirm that the pool id exists, which hands a driver an
+    // oracle for discovering other drivers' pool ids. The response has to be
+    // indistinguishable from the missing-pool case above.
+    const { otherPoolId } = await otherDriverWithPool();
+
+    const response = await startPool(token, otherPoolId);
+    const missing = await startPool(token, randomUUID());
+
+    expect(response.status).toBe(404);
+    expect(response.body.message).toBe('Pool not found');
+    expect(response.body.message).toBe(missing.body.message);
+    expect((await prisma.pool.findUnique({ where: { id: otherPoolId } })).status).toBe('OPEN');
+  });
+
+  it('rejects a pool that is already IN_PROGRESS with 409', async () => {
+    await prisma.pool.update({ where: { id: poolId }, data: { status: 'IN_PROGRESS' } });
+
+    const response = await startPool(token, poolId);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({ success: false, message: 'Pool is not open' });
+  });
+
+  it.each(['COMPLETED', 'CANCELLED'])('rejects a %s pool with 409', async (status) => {
+    await prisma.pool.update({ where: { id: poolId }, data: { status } });
+
+    const response = await startPool(token, poolId);
+
+    expect(response.status).toBe(409);
+    expect(response.body.message).toBe('Pool is not open');
+  });
+
+  it('cannot be started twice', async () => {
+    expect((await startPool(token, poolId)).status).toBe(200);
+
+    const first = await prisma.pool.findUnique({ where: { id: poolId } });
+    const second = await startPool(token, poolId);
+
+    expect(second.status).toBe(409);
+    // The rejected start must not have restamped the row.
+    const stored = await prisma.pool.findUnique({ where: { id: poolId } });
+    expect(stored.startedAt.toISOString()).toBe(first.startedAt.toISOString());
+  });
+
+  it('lets only one of two concurrent starts succeed', async () => {
+    const [first, second] = await Promise.all([startPool(token, poolId), startPool(token, poolId)]);
+
+    // Whichever statement wins the row lock, the other must see a pool that is
+    // no longer OPEN. A blind read-then-write would let both report 200.
+    expect([first.status, second.status].sort()).toEqual([200, 409]);
+
+    const stored = await prisma.pool.findUnique({ where: { id: poolId } });
+    expect(stored.status).toBe('IN_PROGRESS');
+    expect(stored.startedAt).not.toBeNull();
+    expect(await prisma.pool.count({ where: { status: 'IN_PROGRESS' } })).toBe(1);
+  });
+
+  it('ignores a forged status, timestamps and driverId in the body', async () => {
+    const { otherPoolId } = await otherDriverWithPool();
+
+    const response = await startPool(token, poolId, {
+      status: 'COMPLETED',
+      startedAt: '1999-01-01T00:00:00.000Z',
+      completedAt: '1999-01-01T00:00:00.000Z',
+      createdAt: '1999-01-01T00:00:00.000Z',
+      driverId: otherPoolId,
+      vehicleId: randomUUID(),
+    });
+
+    expect(response.status).toBe(200);
+    const { pool } = response.body.data;
+
+    expect(pool.status).toBe('IN_PROGRESS');
+    expect(pool.completedAt).toBeNull();
+    expect(new Date(pool.startedAt).getUTCFullYear()).toBeGreaterThan(2020);
+
+    const stored = await prisma.pool.findUnique({ where: { id: poolId } });
+    expect(stored.status).toBe('IN_PROGRESS');
+    expect(stored.completedAt).toBeNull();
+    expect(stored.driverId).not.toBe(otherPoolId);
+  });
+
+  it('ignores extra arguments handed straight to the service, not just over HTTP', async () => {
+    // The HTTP test above is satisfied by `validateBody` stripping the keys
+    // before the controller runs. This calls the service directly, so it pins
+    // the second layer: `startPool` takes two arguments and reads nothing else,
+    // so dropping the middleware could not open a mass-assignment hole.
+    const { otherPoolId } = await otherDriverWithPool();
+
+    const pool = await startPoolForUser(userId, poolId, {
+      status: 'COMPLETED',
+      startedAt: '1999-01-01T00:00:00.000Z',
+      completedAt: '1999-01-01T00:00:00.000Z',
+      driverId: otherPoolId,
+    });
+
+    expect(pool).toMatchObject({ id: poolId, status: 'IN_PROGRESS', completedAt: null });
+    expect(new Date(pool.startedAt).getUTCFullYear()).toBeGreaterThan(2020);
+
+    const stored = await prisma.pool.findUnique({ where: { id: poolId } });
+    expect(stored.status).toBe('IN_PROGRESS');
+    expect(stored.completedAt).toBeNull();
+  });
+});
+
+describe('PATCH /api/pools/:poolId/complete', () => {
+  let token;
+  let userId;
+  let poolId;
+
+  beforeEach(async () => {
+    ({ token, userId } = await onboardedDriver());
+    ({ id: poolId } = (await createPool(token)).body.data.pool);
+  });
+
+  /**
+   * Puts the pool into IN_PROGRESS, the only state completion accepts. Each test
+   * calls it explicitly instead of the `beforeEach` doing it, because members
+   * can only be added while the pool is still OPEN.
+   */
+  const start = () => startPool(token, poolId);
+
+  it('lets a driver complete their own pool that is in progress', async () => {
+    await start();
+
+    const response = await completePool(token, poolId);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      success: true,
+      message: 'Pool completed successfully',
+    });
+    expect(response.body.data.pool).toMatchObject({ id: poolId, status: 'COMPLETED' });
+  });
+
+  it('persists the pool as COMPLETED', async () => {
+    await start();
+
+    const { id } = (await completePool(token, poolId)).body.data.pool;
+
+    const stored = await prisma.pool.findUnique({ where: { id } });
+    expect(stored.status).toBe('COMPLETED');
+  });
+
+  it('stamps completedAt at the moment of the transition', async () => {
+    await start();
+
+    const before = new Date();
+    const { pool } = (await completePool(token, poolId)).body.data;
+    const after = new Date();
+
+    expect(pool.completedAt).not.toBeNull();
+    const completedAt = new Date(pool.completedAt);
+    expect(completedAt.getTime()).toBeGreaterThanOrEqual(before.getTime());
+    expect(completedAt.getTime()).toBeLessThanOrEqual(after.getTime());
+  });
+
+  it('leaves startedAt exactly as the start wrote it', async () => {
+    await start();
+    const startedAt = (await prisma.pool.findUnique({ where: { id: poolId } })).startedAt;
+
+    const { pool } = (await completePool(token, poolId)).body.data;
+
+    expect(new Date(pool.startedAt).toISOString()).toBe(startedAt.toISOString());
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).startedAt.toISOString()).toBe(
+      startedAt.toISOString(),
+    );
+  });
+
+  it('accepts a request with no body at all', async () => {
+    await start();
+
+    const response = await request(app)
+      .patch(`/api/pools/${poolId}/complete`)
+      .set('Authorization', `Bearer ${token}`)
+      .send();
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pool.status).toBe('COMPLETED');
+  });
+
+  it('moves every ride request to COMPLETED', async () => {
+    const members = await matchRideRequests(token, poolId, 2);
+    await start();
+
+    const response = await completePool(token, poolId);
+    expect(response.status).toBe(200);
+
+    for (const { rideRequest } of members) {
+      const stored = await prisma.rideRequest.findUnique({ where: { id: rideRequest.id } });
+      expect(stored.status).toBe('COMPLETED');
+    }
+  });
+
+  it('settles each ride request at its own PoolMember fare', async () => {
+    // Two different seat counts, so the two fares differ. A flat copy of one
+    // member's fare onto every row would pass a single-member test and fail
+    // this one.
+    const first = await passengerWithRideRequest(
+      { email: 'one@example.com' },
+      { ...rideRequestPayload, seatsRequested: 1 },
+    );
+    const second = await passengerWithRideRequest(
+      { email: 'two@example.com' },
+      { ...rideRequestPayload, seatsRequested: 2 },
+    );
+
+    await addMember(token, poolId, { rideRequestId: first.rideRequest.id });
+    await addMember(token, poolId, { rideRequestId: second.rideRequest.id });
+    await startPool(token, poolId);
+    await completePool(token, poolId);
+
+    const memberRows = await prisma.poolMember.findMany({ where: { poolId } });
+    expect(memberRows).toHaveLength(2);
+
+    for (const member of memberRows) {
+      const stored = await prisma.rideRequest.findUnique({
+        where: { id: member.rideRequestId },
+      });
+
+      expect(stored.finalFarePaisa).toBe(member.farePaisa);
+    }
+
+    const fares = memberRows.map((member) => member.farePaisa);
+    expect(fares[0]).not.toBe(fares[1]);
+  });
+
+  it('rejects a passenger with 403', async () => {
+    await start();
+    const passenger = await authenticate({
+      name: 'Other Passenger',
+      email: 'otherpassenger@example.com',
+      role: 'PASSENGER',
+    });
+
+    const response = await completePool(passenger.token, poolId);
+
+    expect(response.status).toBe(403);
+    expect(response.body.message).toBe('You do not have permission to perform this action');
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('IN_PROGRESS');
+  });
+
+  it('rejects an unauthenticated request with 401', async () => {
+    await start();
+
+    const response = await request(app).patch(`/api/pools/${poolId}/complete`).send();
+
+    expect(response.status).toBe(401);
+    expect(response.body.success).toBe(false);
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('IN_PROGRESS');
+  });
+
+  it('rejects a garbage token with 401', async () => {
+    await start();
+
+    const response = await request(app)
+      .patch(`/api/pools/${poolId}/complete`)
+      .set('Authorization', 'Bearer not.a.jwt')
+      .send();
+
+    expect(response.status).toBe(401);
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('IN_PROGRESS');
+  });
+
+  it('rejects a malformed pool id with a field-level 400', async () => {
+    await start();
+
+    const response = await completePool(token, 'not-a-uuid');
+
+    expect(response.status).toBe(400);
+    expect(response.body.message).toBe('Validation failed');
+    expect(response.body.details).toEqual([
+      { field: 'poolId', message: 'Pool id must be a valid UUID' },
+    ]);
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('IN_PROGRESS');
+  });
+
+  it('returns 404 for a driver who has not onboarded', async () => {
+    await start();
+    const fresh = await authenticate({ name: 'No Profile', email: 'noprofile@example.com' });
+
+    const response = await completePool(fresh.token, poolId);
+
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({ success: false, message: 'Driver profile not found' });
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('IN_PROGRESS');
+  });
+
+  it('returns 404 for a pool that does not exist', async () => {
+    await start();
+
+    const response = await completePool(token, randomUUID());
+
+    expect(response.status).toBe(404);
+    expect(response.body).toMatchObject({ success: false, message: 'Pool not found' });
+  });
+
+  it("returns the same 404 for another driver's pool", async () => {
+    const { otherPoolId, token: otherToken } = await otherDriverWithPool();
+    const { id: otherStartedId } = (await startPool(otherToken, otherPoolId)).body.data.pool;
+
+    const response = await completePool(token, otherStartedId);
+    const missing = await completePool(token, randomUUID());
+
+    expect(response.status).toBe(404);
+    expect(response.body.message).toBe('Pool not found');
+    expect(response.body.message).toBe(missing.body.message);
+    expect((await prisma.pool.findUnique({ where: { id: otherStartedId } })).status).toBe(
+      'IN_PROGRESS',
+    );
+  });
+
+  it('rejects a pool that is still OPEN with 409', async () => {
+    const { id: openPoolId } = (await createPool(token)).body.data.pool;
+
+    const response = await completePool(token, openPoolId);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({ success: false, message: 'Pool is not in progress' });
+    expect((await prisma.pool.findUnique({ where: { id: openPoolId } })).completedAt).toBeNull();
+  });
+
+  it.each(['COMPLETED', 'CANCELLED'])('rejects a %s pool with 409', async (status) => {
+    await prisma.pool.update({ where: { id: poolId }, data: { status } });
+
+    const response = await completePool(token, poolId);
+
+    expect(response.status).toBe(409);
+    expect(response.body.message).toBe('Pool is not in progress');
+  });
+
+  it('cannot be completed twice', async () => {
+    await start();
+    expect((await completePool(token, poolId)).status).toBe(200);
+
+    const first = await prisma.pool.findUnique({ where: { id: poolId } });
+    const second = await completePool(token, poolId);
+
+    expect(second.status).toBe(409);
+    // The rejected completion must not have restamped the row.
+    const stored = await prisma.pool.findUnique({ where: { id: poolId } });
+    expect(stored.completedAt.toISOString()).toBe(first.completedAt.toISOString());
+  });
+
+  it('rolls back the pool transition when a member cannot be settled', async () => {
+    // A membership whose ride request is put back to MATCHED, which the
+    // conditional cascade refuses. Starting the pool has already moved it to
+    // IN_PROGRESS, so this state can only be staged directly. The pool update
+    // has already succeeded when the member write fails, so this is a real proof
+    // of atomicity: the pool has to be back to IN_PROGRESS with no completedAt,
+    // which can only happen if that successful write was rolled back.
+    const { rideRequest } = await passengerWithRideRequest(
+      { email: 'stuck@example.com' },
+      { ...rideRequestPayload, seatsRequested: 1 },
+    );
+    await addMember(token, poolId, { rideRequestId: rideRequest.id });
+    await start();
+    await prisma.rideRequest.update({ where: { id: rideRequest.id }, data: { status: 'MATCHED' } });
+
+    const startedAt = (await prisma.pool.findUnique({ where: { id: poolId } })).startedAt;
+    const response = await completePool(token, poolId);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({
+      success: false,
+      message: 'Ride request cannot be completed in its current status',
+    });
+
+    const stored = await prisma.pool.findUnique({ where: { id: poolId } });
+    expect(stored.status).toBe('IN_PROGRESS');
+    expect(stored.completedAt).toBeNull();
+    expect(stored.startedAt.toISOString()).toBe(startedAt.toISOString());
+
+    const rideRequestRow = await prisma.rideRequest.findUnique({ where: { id: rideRequest.id } });
+    expect(rideRequestRow.status).toBe('MATCHED');
+    expect(rideRequestRow.finalFarePaisa).toBeNull();
+  });
+
+  it('settles no member at all when one of them fails', async () => {
+    // Two members, one of them unsettleable. The cascade has no defined member
+    // order, so this asserts the order-independent outcome: after the rollback
+    // nothing is COMPLETED and no fare was written anywhere.
+    const first = await passengerWithRideRequest(
+      { email: 'first@example.com' },
+      { ...rideRequestPayload, seatsRequested: 1 },
+    );
+    const second = await passengerWithRideRequest(
+      { email: 'second@example.com' },
+      { ...rideRequestPayload, seatsRequested: 1 },
+    );
+
+    await addMember(token, poolId, { rideRequestId: first.rideRequest.id });
+    await addMember(token, poolId, { rideRequestId: second.rideRequest.id });
+    await start();
+    await prisma.rideRequest.update({ where: { id: second.rideRequest.id }, data: { status: 'MATCHED' } });
+
+    expect((await completePool(token, poolId)).status).toBe(409);
+
+    const completed = await prisma.rideRequest.count({ where: { status: 'COMPLETED' } });
+    const settled = await prisma.rideRequest.count({ where: { finalFarePaisa: { not: null } } });
+    expect(completed).toBe(0);
+    expect(settled).toBe(0);
+    expect((await prisma.pool.findUnique({ where: { id: poolId } })).status).toBe('IN_PROGRESS');
+  });
+
+  it('lets only one of two concurrent completions succeed', async () => {
+    await start();
+
+    const [first, second] = await Promise.all([
+      completePool(token, poolId),
+      completePool(token, poolId),
+    ]);
+
+    expect([first.status, second.status].sort()).toEqual([200, 409]);
+
+    const stored = await prisma.pool.findUnique({ where: { id: poolId } });
+    expect(stored.status).toBe('COMPLETED');
+    expect(stored.completedAt).not.toBeNull();
+    expect(await prisma.pool.count({ where: { status: 'COMPLETED' } })).toBe(1);
+  });
+
+  it('returns exactly the documented DTO fields', async () => {
+    await start();
+
+    const { pool } = (await completePool(token, poolId)).body.data;
+
+    expect(Object.keys(pool).sort()).toEqual(
+      ['id', 'driverId', 'vehicleId', 'status', 'startedAt', 'completedAt', 'createdAt', 'updatedAt'].sort(),
+    );
+  });
+
+  it('never exposes the driver, the vehicle, the members or a credential', async () => {
+    await start();
+
+    const response = await completePool(token, poolId);
+    const { pool } = response.body.data;
+
+    expect(pool).not.toHaveProperty('driver');
+    expect(pool).not.toHaveProperty('vehicle');
+    expect(pool).not.toHaveProperty('members');
+    expect(JSON.stringify(response.body)).not.toContain('passwordHash');
+    expect(JSON.stringify(response.body)).not.toContain(driver.password);
+  });
+
+  it('ignores a forged finalFarePaisa, status and startedAt in the body', async () => {
+    const { rideRequest } = await passengerWithRideRequest(
+      { email: 'forger@example.com' },
+      { ...rideRequestPayload, seatsRequested: 1 },
+    );
+    await addMember(token, poolId, { rideRequestId: rideRequest.id });
+    await startPool(token, poolId);
+
+    const startedAt = (await prisma.pool.findUnique({ where: { id: poolId } })).startedAt;
+    const farePaisa = (
+      await prisma.poolMember.findFirst({ where: { poolId, rideRequestId: rideRequest.id } })
+    ).farePaisa;
+
+    const response = await completePool(token, poolId, {
+      finalFarePaisa: 1,
+      status: 'CANCELLED',
+      startedAt: '1999-01-01T00:00:00.000Z',
+      completedAt: '1999-01-01T00:00:00.000Z',
+      driverId: randomUUID(),
+      vehicleId: randomUUID(),
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.pool.status).toBe('COMPLETED');
+    expect(new Date(response.body.data.pool.startedAt).toISOString()).toBe(
+      startedAt.toISOString(),
+    );
+
+    const stored = await prisma.rideRequest.findUnique({ where: { id: rideRequest.id } });
+    expect(stored.status).toBe('COMPLETED');
+    expect(stored.finalFarePaisa).toBe(farePaisa);
+    expect(stored.finalFarePaisa).not.toBe(1);
+  });
+
+  it('ignores extra arguments handed straight to the service, not just over HTTP', async () => {
+    const { rideRequest } = await passengerWithRideRequest(
+      { email: 'direct@example.com' },
+      { ...rideRequestPayload, seatsRequested: 1 },
+    );
+    await addMember(token, poolId, { rideRequestId: rideRequest.id });
+    await startPool(token, poolId);
+
+    const startedAt = (await prisma.pool.findUnique({ where: { id: poolId } })).startedAt;
+    const farePaisa = (
+      await prisma.poolMember.findFirst({ where: { poolId, rideRequestId: rideRequest.id } })
+    ).farePaisa;
+
+    const pool = await completePoolForUser(userId, poolId, {
+      finalFarePaisa: 1,
+      status: 'CANCELLED',
+      startedAt: '1999-01-01T00:00:00.000Z',
+      completedAt: '1999-01-01T00:00:00.000Z',
+    });
+
+    expect(pool).toMatchObject({ id: poolId, status: 'COMPLETED' });
+    expect(new Date(pool.startedAt).toISOString()).toBe(startedAt.toISOString());
+
+    const stored = await prisma.rideRequest.findUnique({ where: { id: rideRequest.id } });
+    expect(stored.status).toBe('COMPLETED');
+    expect(stored.finalFarePaisa).toBe(farePaisa);
+    expect(stored.finalFarePaisa).not.toBe(1);
   });
 });

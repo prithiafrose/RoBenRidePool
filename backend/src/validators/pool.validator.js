@@ -20,7 +20,22 @@ import { z } from 'zod';
  * convenience, not the security control — `createPool` never receives
  * `req.body` at all, so a stripped key is also a key the service cannot read.
  */
-export const createPoolSchema = z.object({}).nullish();
+const emptyBody = z.object({}).nullish();
+
+export const createPoolSchema = emptyBody;
+
+/**
+ * Body of the lifecycle endpoints, `PATCH /api/pools/:poolId/start` and
+ * `PATCH /api/pools/:poolId/complete`.
+ *
+ * Empty for the same reason as `createPoolSchema`, and it is the same schema
+ * object rather than a second copy: a status transition takes nothing from the
+ * client. `status`, `startedAt`, `completedAt`, `finalFarePaisa`, `driverId` and
+ * `vehicleId` are all decided server-side, so a client that sends them has them
+ * discarded by `validateBody`, and the controller forwards no body at all — so
+ * even without this middleware the service would have no value to be misled by.
+ */
+export const poolLifecycleSchema = emptyBody;
 
 /**
  * Path parameter of `POST /api/pools/:poolId/members`.

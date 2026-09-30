@@ -229,3 +229,183 @@ export const addPoolMember = async (userId, poolId, rideRequestId) => {
     throw error;
   }
 };
+
+/**
+ * Resolves the caller's `DriverProfile` and their own `Pool`, for the lifecycle
+ * endpoints.
+ *
+ * Ownership is answered with the same 404 as a missing pool, on purpose. A 403
+ * would confirm that the pool id exists, which hands one driver an oracle for
+ * discovering other drivers' pool ids. This is the same reasoning that governs
+ * `addPoolMember` above and `getRideRequestById` in `rideRequest.service.js`.
+ *
+ * Only the columns the two transitions need are selected. `driverId` and
+ * `status` are the only ones read, so the projection cannot accidentally widen
+ * into something the response would then have to hide.
+ */
+const findOwnPool = async (userId, poolId) => {
+  const driverProfile = await prisma.driverProfile.findUnique({ where: { userId } });
+
+  if (!driverProfile) {
+    throw AppError.notFound('Driver profile not found');
+  }
+
+  const pool = await prisma.pool.findUnique({
+    where: { id: poolId },
+    select: { id: true, driverId: true, status: true },
+  });
+
+  if (!pool) {
+    throw AppError.notFound('Pool not found');
+  }
+
+  if (pool.driverId !== driverProfile.id) {
+    throw AppError.notFound('Pool not found');
+  }
+
+  return pool;
+};
+
+/**
+ * Starts a pool: `OPEN -> IN_PROGRESS`, and every matched ride request in it
+ * `MATCHED -> IN_PROGRESS`.
+ *
+ * The pool and its members are moved together or not at all. A pool on the road
+ * whose passengers still read `MATCHED`, or a passenger marked `IN_PROGRESS`
+ * against a pool that never left, are both states the lifecycle must never
+ * leave behind, so both writes share one transaction.
+ *
+ * The transition itself is a conditional `updateMany` on `status: 'OPEN'`, not
+ * a blind write after the read above. It compiles to a single
+ * `UPDATE ... WHERE id = ? AND status = 'OPEN'`, so PostgreSQL decides the
+ * winner: two concurrent starts cannot both observe `OPEN` and both proceed.
+ * `count === 0` is therefore the conflict signal, and because `startedAt` is
+ * only ever written by that winning statement, a losing racer cannot stamp a
+ * second start time onto the row.
+ *
+ * Starting an empty pool is allowed: an `OPEN` pool with no members is a state
+ * the API can legitimately produce, and there is no rule in the schema or the
+ * specification that forbids it.
+ *
+ * The member cascade is one bulk statement because every member takes the same
+ * new value. It is deliberately scoped to `status: 'MATCHED'`, so a member in
+ * any other state is left untouched rather than being dragged forward by a
+ * transition it did not take part in. The API cannot produce that state: the
+ * matching step is the only writer of `PoolMember`, and it always leaves the
+ * request `MATCHED`.
+ */
+export const startPool = async (userId, poolId) => {
+  const pool = await findOwnPool(userId, poolId);
+
+  if (pool.status !== 'OPEN') {
+    throw AppError.conflict('Pool is not open');
+  }
+
+  const startedAt = new Date();
+
+  const started = await prisma.$transaction(async (tx) => {
+    const { count } = await tx.pool.updateMany({
+      where: {
+        id: pool.id,
+        status: 'OPEN',
+      },
+      data: {
+        status: 'IN_PROGRESS',
+        startedAt,
+      },
+    });
+
+    if (count === 0) {
+      throw AppError.conflict('Pool is not open');
+    }
+
+    await tx.rideRequest.updateMany({
+      where: {
+        status: 'MATCHED',
+        poolMemberships: { some: { poolId: pool.id } },
+      },
+      data: {
+        status: 'IN_PROGRESS',
+      },
+    });
+
+    // Re-read through the transaction client so the response reflects the row
+    // this transaction just wrote, rather than the pre-flight read above.
+    return tx.pool.findUnique({ where: { id: pool.id } });
+  });
+
+  return toPool(started);
+};
+
+/**
+ * Completes a pool: `IN_PROGRESS -> COMPLETED`, and every ride request in it
+ * `IN_PROGRESS -> COMPLETED` with its fare settled.
+ *
+ * `startedAt` is not part of the `data` below, so it keeps the value written by
+ * `startPool` and a client cannot move it.
+ *
+ * Unlike the start, the member loop cannot be a single bulk statement: every
+ * member settles at a different amount, because `PoolMember.farePaisa` is that
+ * passenger's own agreed fare and two people sharing one Tesla do not pay the
+ * same. `finalFarePaisa` is therefore always derived from the membership row,
+ * never from the request body, which is the only money value that ever reaches
+ * the write.
+ *
+ * Each member's update is conditional on `IN_PROGRESS`, and a member that does
+ * not move fails the whole transaction. A pool that reported `COMPLETED` while
+ * one of its passengers was still on an earlier status would be a lie the
+ * dashboard would repeat, so the transition is refused instead. The pool update
+ * is rolled back with it.
+ */
+export const completePool = async (userId, poolId) => {
+  const pool = await findOwnPool(userId, poolId);
+
+  if (pool.status !== 'IN_PROGRESS') {
+    throw AppError.conflict('Pool is not in progress');
+  }
+
+  const completedAt = new Date();
+
+  const completed = await prisma.$transaction(async (tx) => {
+    const { count } = await tx.pool.updateMany({
+      where: {
+        id: pool.id,
+        status: 'IN_PROGRESS',
+      },
+      data: {
+        status: 'COMPLETED',
+        completedAt,
+      },
+    });
+
+    if (count === 0) {
+      throw AppError.conflict('Pool is not in progress');
+    }
+
+    const members = await tx.poolMember.findMany({
+      where: { poolId: pool.id },
+      select: { rideRequestId: true, farePaisa: true },
+    });
+
+    for (const member of members) {
+      const { count: settled } = await tx.rideRequest.updateMany({
+        where: {
+          id: member.rideRequestId,
+          status: 'IN_PROGRESS',
+        },
+        data: {
+          status: 'COMPLETED',
+          finalFarePaisa: member.farePaisa,
+        },
+      });
+
+      if (settled === 0) {
+        throw AppError.conflict('Ride request cannot be completed in its current status');
+      }
+    }
+
+    return tx.pool.findUnique({ where: { id: pool.id } });
+  });
+
+  return toPool(completed);
+};

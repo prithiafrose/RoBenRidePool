@@ -1,4 +1,4 @@
-import { addPoolMember, createPool } from '../services/pool.service.js';
+import { addPoolMember, completePool, createPool, startPool } from '../services/pool.service.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 
 /** POST /api/pools (protected by `authenticate` and `requireRole`) */
@@ -19,4 +19,23 @@ export const addMember = async (req, res) => {
   const poolMember = await addPoolMember(req.user.id, req.params.poolId, req.body.rideRequestId);
 
   return sendSuccess(res, { poolMember }, 201, 'Ride request added to pool successfully');
+};
+
+/** PATCH /api/pools/:poolId/start (protected by `authenticate` and `requireRole`) */
+export const start = async (req, res) => {
+  // `req.body` is not forwarded, mirroring `create`: the new status and the
+  // start timestamp are both decided in the service, so a client-supplied
+  // `status` or `startedAt` has no path to the write.
+  const pool = await startPool(req.user.id, req.params.poolId);
+
+  return sendSuccess(res, { pool }, 200, 'Pool started successfully');
+};
+
+/** PATCH /api/pools/:poolId/complete (protected by `authenticate` and `requireRole`) */
+export const complete = async (req, res) => {
+  // `req.body` is not forwarded here either, which is what keeps
+  // `finalFarePaisa` server-derived from `PoolMember.farePaisa`.
+  const pool = await completePool(req.user.id, req.params.poolId);
+
+  return sendSuccess(res, { pool }, 200, 'Pool completed successfully');
 };
