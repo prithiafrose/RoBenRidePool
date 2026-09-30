@@ -76,6 +76,13 @@ model User {
   /// Ride requests this user made as a passenger.
   rideRequests  RideRequest[]
 
+  /// Ratings this user gave to the other party after a completed pool. The
+  /// relation is named because a User has two distinct edges to Rating.
+  ratingsGiven Rating[] @relation("RatingsGiven")
+  /// Ratings this user received from the other party. A driver's scores live on
+  /// their User row, which is why the target is a User and not a DriverProfile.
+  ratingsReceived Rating[] @relation("RatingsReceived")
+
   @@map("users")
 }
 
@@ -207,6 +214,9 @@ model Pool {
   /// their individual fare.
   members PoolMember[]
 
+  /// Scores left by the participants once this pool is COMPLETED.
+  ratings Rating[]
+
   // "Which open pools does this driver have?" and lifecycle listings.
   @@index([driverId, status])
   @@index([status, createdAt])
@@ -239,4 +249,50 @@ model PoolMember {
   /// Reverse lookup: "which pool is this request in?" is served by the unique
   /// index on rideRequestId, so no separate @@index is declared here.
   @@map("pool_members")
+}
+
+// ---------------------------------------------------------------------------
+// Ratings
+// ---------------------------------------------------------------------------
+
+/// A 1-5 score one participant leaves for the other after a completed pool.
+///
+/// The rating is deliberately about the Pool rather than the PoolMember: a pool
+/// is the ride, and the `(poolId, raterId)` unique index is what stops the same
+/// person scoring the same ride twice.
+///
+/// Both sides are modelled as `User`, never as `DriverProfile`. A driver is
+/// already a User through `DriverProfile.userId`, so one pair of User
+/// foreign keys expresses "passenger scores driver" and "driver scores
+/// passenger" without a polymorphic column and without losing referential
+/// integrity. That is also why the two edges are named: a User has two distinct
+/// edges to Rating.
+model Rating {
+  id String @id @default(uuid())
+
+  /// The completed pool being scored.
+  poolId String
+  pool   Pool   @relation(fields: [poolId], references: [id], onDelete: Cascade)
+
+  /// Who left the score. Taken from the access token, never from the body.
+  raterId String
+  rater   User   @relation("RatingsGiven", fields: [raterId], references: [id], onDelete: Cascade)
+
+  /// Who was scored. The other participant: the driver when a passenger rates,
+  /// or the single passenger when the driver of a one-passenger pool rates.
+  rateeId String
+  ratee   User   @relation("RatingsReceived", fields: [rateeId], references: [id], onDelete: Cascade)
+
+  /// 1 to 5 inclusive. The range is enforced by the validator, since Prisma
+  /// cannot express a CHECK constraint on an Int column in the schema.
+  score Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One score per participant per ride.
+  @@unique([poolId, raterId])
+  /// "The scores this user received, newest first."
+  @@index([rateeId, createdAt])
+  @@map("ratings")
 }
