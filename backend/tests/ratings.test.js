@@ -19,10 +19,25 @@ const vehicle = {
   seatCapacity: 4,
 };
 
+/**
+ * A departure window the API accepts. Derived from the clock rather than
+ * hard-coded, because `departureFrom` must not be in the past and a literal
+ * would start failing the day it went by.
+ */
+const futureWindow = (hoursFromNow = 24) => {
+  const departureFrom = new Date(Date.now() + hoursFromNow * 3_600_000);
+
+  return {
+    departureFrom: departureFrom.toISOString(),
+    departureTo: new Date(departureFrom.getTime() + 3_600_000).toISOString(),
+  };
+};
+
 const rideRequestPayload = {
   pickupArea: 'Dhanmondi',
   destinationArea: 'Gulshan',
   seatsRequested: 1,
+  ...futureWindow(),
 };
 
 const register = (payload) => request(app).post('/api/auth/register').send(payload);

@@ -15,10 +15,29 @@ const passenger = {
   role: 'PASSENGER',
 };
 
+/**
+ * A departure window the API accepts, built from the clock rather than written
+ * down as a literal.
+ *
+ * `departureFrom` must not be in the past, so a hard-coded date would make this
+ * fixture rot into a 400 on the day it expired. Offsetting from `Date.now()`
+ * keeps it valid forever, and emitting `Z` matches the UTC instants the API
+ * stores. `startPool` helpers elsewhere use the same "24 hours out" offset.
+ */
+const futureWindow = (hoursFromNow = 24) => {
+  const departureFrom = new Date(Date.now() + hoursFromNow * 3_600_000);
+
+  return {
+    departureFrom: departureFrom.toISOString(),
+    departureTo: new Date(departureFrom.getTime() + 3_600_000).toISOString(),
+  };
+};
+
 const rideRequest = {
   pickupArea: 'Dhanmondi',
   destinationArea: 'Gulshan',
   seatsRequested: 2,
+  ...futureWindow(),
 };
 
 const register = (payload = passenger) => request(app).post('/api/auth/register').send(payload);
@@ -565,6 +584,8 @@ describe('GET /api/ride-requests/:id', () => {
         'destinationArea',
         'destinationLat',
         'destinationLng',
+        'departureFrom',
+        'departureTo',
         'seatsRequested',
         'estimatedFarePaisa',
         'finalFarePaisa',
@@ -686,6 +707,8 @@ describe('PATCH /api/ride-requests/:id/cancel', () => {
         'destinationArea',
         'destinationLat',
         'destinationLng',
+        'departureFrom',
+        'departureTo',
         'seatsRequested',
         'estimatedFarePaisa',
         'finalFarePaisa',
@@ -867,5 +890,232 @@ describe('PATCH /api/ride-requests/:id/cancel', () => {
     expect(response.status).toBe(200);
     const listed = response.body.data.rideRequests.find((item) => item.id === created.id);
     expect(listed.status).toBe('CANCELLED');
+  });
+});
+
+/**
+ * The departure window is a first-class part of a ride request: `README.md` says a
+ * passenger requests "an origin, a destination and a time window", and
+ * `docs/architecture.md` lists "departure window" among `RideRequest`'s
+ * responsibilities. These tests are grouped together rather than spread across the
+ * four endpoint suites because the rules are about the field itself, and because
+ * the interesting cases are rejections that belong to creation.
+ */
+describe('RideRequest departure window', () => {
+  let token;
+  let userId;
+
+  beforeEach(async () => {
+    ({ token, userId } = await authenticate());
+  });
+
+  const create = (payload) => createRide(token, payload);
+
+  /** A specific window, so a test can assert on the exact instants it asked for. */
+  const windowOf = (from, to) => ({ ...rideRequest, departureFrom: from, departureTo: to });
+
+  it('persists the window on the created request', async () => {
+    // The window is built once and reused in the assertion: calling
+    // `futureWindow()` twice would produce two different instants, because each
+    // call offsets from a freshly read clock.
+    const window = futureWindow();
+
+    const response = await create({ ...rideRequest, ...window });
+
+    expect(response.status).toBe(201);
+
+    const stored = await prisma.rideRequest.findUnique({
+      where: { id: response.body.data.rideRequest.id },
+    });
+    expect(stored.departureFrom.toISOString()).toBe(window.departureFrom);
+    expect(stored.departureTo.toISOString()).toBe(window.departureTo);
+  });
+
+  it('returns both fields on the created request', async () => {
+    const window = futureWindow();
+
+    const response = await create({ ...rideRequest, ...window });
+
+    expect(response.status).toBe(201);
+    expect(response.body.data.rideRequest.departureFrom).toBe(window.departureFrom);
+    expect(response.body.data.rideRequest.departureTo).toBe(window.departureTo);
+  });
+
+  it('returns both fields on the collection listing', async () => {
+    const created = await createOne(token);
+
+    const response = await listRides(token);
+
+    expect(response.status).toBe(200);
+    const listed = response.body.data.rideRequests.find((item) => item.id === created.id);
+    expect(listed.departureFrom).toBe(created.departureFrom);
+    expect(listed.departureTo).toBe(created.departureTo);
+  });
+
+  it('returns both fields on the single request endpoint', async () => {
+    const created = await createOne(token);
+
+    const response = await getRide(token, created.id);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.rideRequest.departureFrom).toBe(created.departureFrom);
+    expect(response.body.data.rideRequest.departureTo).toBe(created.departureTo);
+  });
+
+  it('stores an offset timestamp as the UTC instant it denotes', async () => {
+    // 08:00+06:00 is 02:00 UTC, so this pins the conversion rather than merely
+    // accepting the string: a server that stored the wall-clock digits would
+    // answer 08:00Z and fail here.
+    const response = await create(
+      windowOf('2026-10-01T08:00:00+06:00', '2026-10-01T09:30:00+06:00'),
+    );
+
+    expect(response.status).toBe(201);
+    expect(response.body.data.rideRequest.departureFrom).toBe('2026-10-01T02:00:00.000Z');
+    expect(response.body.data.rideRequest.departureTo).toBe('2026-10-01T03:30:00.000Z');
+
+    const stored = await prisma.rideRequest.findUnique({
+      where: { id: response.body.data.rideRequest.id },
+    });
+    expect(stored.departureFrom.toISOString()).toBe('2026-10-01T02:00:00.000Z');
+  });
+
+  it('treats an offset timestamp and its Z equivalent as the same instant', async () => {
+    const withOffset = await create(
+      windowOf('2026-10-01T08:00:00+06:00', '2026-10-01T09:00:00+06:00'),
+    );
+    const withZ = await create(windowOf('2026-10-01T02:00:00Z', '2026-10-01T03:00:00Z'));
+
+    expect(withOffset.body.data.rideRequest.departureFrom).toBe(
+      withZ.body.data.rideRequest.departureFrom,
+    );
+    expect(withOffset.body.data.rideRequest.departureTo).toBe(withZ.body.data.rideRequest.departureTo);
+  });
+
+  it('rejects a window whose bounds are equal', async () => {
+    const at = futureWindow().departureFrom;
+    const response = await create(windowOf(at, at));
+
+    expect(response.status).toBe(400);
+    expect(response.body.success).toBe(false);
+    expect(response.body.details[0].field).toBe('departureTo');
+  });
+
+  it('rejects a window that ends before it starts', async () => {
+    const from = futureWindow(48).departureFrom;
+    const to = futureWindow(24).departureTo;
+    const response = await create(windowOf(from, to));
+
+    expect(response.status).toBe(400);
+    expect(response.body.details[0].field).toBe('departureTo');
+  });
+
+  it.each([
+    ['a missing departureFrom', 'departureFrom'],
+    ['a missing departureTo', 'departureTo'],
+  ])('rejects %s with 400 and a field error', async (_label, field) => {
+    const payload = { ...rideRequest };
+    delete payload[field];
+
+    const response = await create(payload);
+
+    expect(response.status).toBe(400);
+    expect(response.body.message).toBe('Validation failed');
+    expect(response.body.details.some((detail) => detail.field === field)).toBe(true);
+  });
+
+  it('rejects a naive datetime that carries no offset', async () => {
+    const response = await create(windowOf('2026-10-01T08:00:00', '2026-10-01T09:00:00'));
+
+    expect(response.status).toBe(400);
+    expect(response.body.details.some((detail) => detail.field === 'departureFrom')).toBe(true);
+  });
+
+  it.each([
+    ['an epoch millisecond number', 1_778_000_000_000],
+    ['a fractional number', 1_778_000_000_000.5],
+  ])('rejects %s without coercing it to a string', async (_label, value) => {
+    const response = await create(windowOf(value, futureWindow(48).departureTo));
+
+    expect(response.status).toBe(400);
+    expect(response.body.details.some((detail) => detail.field === 'departureFrom')).toBe(true);
+  });
+
+  it('rejects a departure window that has already started', async () => {
+    const response = await create(
+      windowOf('2020-01-01T08:00:00Z', '2020-01-01T09:00:00Z'),
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.body.details.some((detail) => detail.field === 'departureFrom')).toBe(true);
+  });
+
+  it('reports the past departure only once, not also as an ordering failure', async () => {
+    const response = await create(windowOf('2020-01-01T08:00:00Z', '2020-01-01T09:00:00Z'));
+
+    expect(response.status).toBe(400);
+    const fields = response.body.details.map((detail) => detail.field);
+    expect(fields).toContain('departureFrom');
+    expect(fields).not.toContain('departureTo');
+  });
+
+  it('rejects a window that has already started even when it has not ended', async () => {
+    // The rule is on `departureFrom`, not on whether the window is still open, so
+    // a window that began an hour ago is refused even though `departureTo` is
+    // still in the future. Documented here because it is a consequence worth
+    // being deliberate about rather than a case that falls out by accident.
+    const from = new Date(Date.now() - 3_600_000).toISOString();
+    const to = futureWindow(2).departureTo;
+
+    const response = await create(windowOf(from, to));
+
+    expect(response.status).toBe(400);
+    expect(response.body.details.some((detail) => detail.field === 'departureFrom')).toBe(true);
+  });
+
+  it('accepts a window that ends far in the future, having no horizon rule', async () => {
+    const response = await create(
+      windowOf(futureWindow(48).departureFrom, '2099-01-01T00:00:00Z'),
+    );
+
+    expect(response.status).toBe(201);
+    expect(response.body.data.rideRequest.departureTo).toBe('2099-01-01T00:00:00.000Z');
+  });
+
+  it('ignores a forged fare, status and passenger, as it did before', async () => {
+    const response = await createRide(token, {
+      ...rideRequest,
+      estimatedFarePaisa: 1,
+      finalFarePaisa: 1,
+      status: 'MATCHED',
+      passengerId: randomUUID(),
+    });
+
+    expect(response.status).toBe(201);
+
+    const created = response.body.data.rideRequest;
+    // Asserting the server values rather than a fare figure, so this test is
+    // about who owns each column and not about the placeholder fare table.
+    expect(created.estimatedFarePaisa).not.toBe(1);
+    expect(created.finalFarePaisa).toBeNull();
+    expect(created.status).toBe('WAITING');
+    expect(created.passengerId).toBe(userId);
+  });
+
+  it('keeps the window through a cancellation', async () => {
+    const created = await createOne(token);
+
+    const response = await cancelRide(token, created.id);
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.rideRequest).toMatchObject({
+      departureFrom: created.departureFrom,
+      departureTo: created.departureTo,
+      status: 'CANCELLED',
+    });
+
+    const stored = await prisma.rideRequest.findUnique({ where: { id: created.id } });
+    expect(stored.departureFrom.toISOString()).toBe(created.departureFrom);
+    expect(stored.departureTo.toISOString()).toBe(created.departureTo);
   });
 });

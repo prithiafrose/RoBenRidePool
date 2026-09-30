@@ -159,6 +159,16 @@ model RideRequest {
   destinationLat  Float?
   destinationLng  Float?
 
+  /// Earliest departure the passenger can be picked up, stored as a UTC instant.
+  ///
+  /// The client must send ISO 8601 with an explicit offset, so the offset is
+  /// applied here and never has to be guessed. The column is `TIMESTAMP(3)`
+  /// without time zone, like every other timestamp in this schema, so what is
+  /// stored is always the UTC instant.
+  departureFrom DateTime
+  /// Latest departure the passenger can be picked up, stored as a UTC instant.
+  departureTo   DateTime
+
   /// Seats the passenger wants. 1..capacity of the eventual Tesla.
   seatsRequested     Int
   /// Estimate at request time, in paisa. 32-bit Int allows ~21.4M BDT, which

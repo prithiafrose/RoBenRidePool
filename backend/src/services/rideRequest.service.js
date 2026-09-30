@@ -46,6 +46,8 @@ const toRideRequest = (rideRequest) => ({
   destinationArea: rideRequest.destinationArea,
   destinationLat: rideRequest.destinationLat,
   destinationLng: rideRequest.destinationLng,
+  departureFrom: rideRequest.departureFrom,
+  departureTo: rideRequest.departureTo,
   seatsRequested: rideRequest.seatsRequested,
   estimatedFarePaisa: rideRequest.estimatedFarePaisa,
   finalFarePaisa: rideRequest.finalFarePaisa,
@@ -58,6 +60,18 @@ const toRideRequest = (rideRequest) => ({
  *
  * `passengerId` comes from the verified access token, never from the body, and
  * `status` is left to the Prisma default so a new request is always WAITING.
+ *
+ * The departure window arrives as the validated ISO 8601 strings and is converted
+ * to `Date` here, which is where a `Date` belongs: the validator's job is to
+ * decide whether the value is well formed, not to reshape it. `new Date` applies
+ * the offset the client stated and yields the UTC instant, so a `+06:00` value
+ * and the equivalent `Z` value produce the same stored timestamp.
+ *
+ * Both conversions are written after the `...request` spread so they overwrite
+ * whatever those keys held. That is the same reason `passengerId` and
+ * `estimatedFarePaisa` are also assigned here rather than taken from the body:
+ * every field the client must not control is assigned by the server after the
+ * spread, so a stripped-but-present key cannot reach the insert.
  */
 export const createRideRequest = async (passengerId, request) => {
   const passenger = await prisma.user.findUnique({ where: { id: passengerId } });
@@ -69,7 +83,13 @@ export const createRideRequest = async (passengerId, request) => {
   const estimatedFarePaisa = calculateEstimatedFarePaisa(request);
 
   const rideRequest = await prisma.rideRequest.create({
-    data: { ...request, passengerId, estimatedFarePaisa },
+    data: {
+      ...request,
+      departureFrom: new Date(request.departureFrom),
+      departureTo: new Date(request.departureTo),
+      passengerId,
+      estimatedFarePaisa,
+    },
   });
 
   return toRideRequest(rideRequest);
